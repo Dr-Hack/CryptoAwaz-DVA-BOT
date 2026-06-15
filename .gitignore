@@ -1,0 +1,9 @@
+# Secrets — never commit these
+.env
+credentials.json
+
+# Runtime state
+active_deal.json
+
+# Dependencies
+node_modules/
