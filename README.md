@@ -1,7 +1,7 @@
-# 🤖 CryptoAwaz DVA Bot
+# 🤖 CryptoAwaz DVA Discord Bot
 
 > A Discord escrow bot for managing P2P USDT ↔ PKR trades on **Crypto Awaz**.  
-> Handles the full deal lifecycle — from role assignment to Google Sheets logging — with built-in fee calculation.
+> Handles the full deal lifecycle — from role assignment to Google Sheets logging — with built-in fee calculation for users.
 
 [![Discord](https://img.shields.io/badge/Discord-Join%20Server-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/cryptoawaz)
 [![Website](https://img.shields.io/badge/Website-cryptoawaz.com-F0B132?style=for-the-badge&logo=googlechrome&logoColor=white)](https://cryptoawaz.com)
