@@ -36,11 +36,13 @@ const STAFF = {
 // ─── ENV CONFIG ───────────────────────────────────────────────────────────────
 const DVA_CHANNEL_ID     = process.env.DVA_CHANNEL_ID;
 const DVA_TEMP_ROLE_ID   = process.env.DVA_TEMP_ROLE_ID;
+const BUYSELL_CHANNEL_ID = process.env.BUYSELL_CHANNEL_ID;
 const SHEET_ID           = process.env.SHEET_ID;
 const FUND_LOG_TAB       = process.env.SHEET_TAB || "Fund Log";
 const MONTHLY_TAB        = "Monthly Collection";
 const BOOSTER_MIN_MONTHS = 3;
 const BOOSTER_THRESHOLD  = 500;
+const STAFF_ROLE_ID      = "831157132346130492";
 
 // ─── GOOGLE SHEETS AUTH ───────────────────────────────────────────────────────
 function getSheets() {
@@ -402,6 +404,13 @@ client.on("interactionCreate", async interaction => {
       `${STAFF[staffId].message}`
     );
 
+    const buySellChannel = guild.channels.cache.get(BUYSELL_CHANNEL_ID);
+    if (buySellChannel) {
+      await buySellChannel.send(
+        `🎯 <@${buyer.id}> & <@${seller.id}> — Please head over to <#${DVA_CHANNEL_ID}> to proceed.`
+      );
+    }
+
     return interaction.editReply({ content: `✅ Deal started. DVA-Temp assigned to <@${buyer.id}> and <@${seller.id}>.` });
   }
 
@@ -507,6 +516,13 @@ client.on("interactionCreate", async interaction => {
       } catch (e) { console.error("[DVA] Role removal error:", e); }
     }, 5000);
 
+    const buySellChannel = guild.channels.cache.get(BUYSELL_CHANNEL_ID);
+    if (buySellChannel) {
+      await buySellChannel.send(
+        `🔔 Previous DVA has concluded. You may tag Staff again for DVA.`
+      );
+    }
+
     return interaction.editReply({ content: "✅ Deal closed. Roles will be removed in 5 seconds." });
   }
 
@@ -537,8 +553,6 @@ client.on("interactionCreate", async interaction => {
 });
 
 // ─── STAFF MENTION LISTENER ───────────────────────────────────────────────────
-const BUYSELL_CHANNEL_ID = process.env.BUYSELL_CHANNEL_ID;
-const STAFF_ROLE_ID      = "831157132346130492";
 
 client.on("messageCreate", async message => {
   if (message.author.bot) return;
@@ -547,7 +561,7 @@ client.on("messageCreate", async message => {
   if (!activeDeal) return;
 
   await message.reply(
-    `⏳ A DVA deal is currently in progress. Please wait until it's completed and a staff member will assist you shortly.`
+    `⏳ A DVA deal is currently in progress. Please wait and I will let you know once the ongoing deal is over.`
   );
 });
 
