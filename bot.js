@@ -467,6 +467,7 @@ client.on("interactionCreate", async interaction => {
     if (!activeDeal)                    return interaction.reply({ content: "❌ No active deal.", ephemeral: true });
     if (activeDeal.staffId !== staffId) return interaction.reply({ content: "❌ You didn't start this deal.", ephemeral: true });
     if (!activeDeal.escrowAmount)       return interaction.reply({ content: "❌ Run /dva confirm first.", ephemeral: true });
+    if (activeDeal.released)            return interaction.reply({ content: "⚠️ Escrow has already been released for this deal. Use **/dva close** to wrap up.", ephemeral: true });
 
     await interaction.deferReply({ ephemeral: true });
 
