@@ -144,28 +144,58 @@ async function updateSummaryBlock(sheets) {
   ]);
 }
 
+// Only tabs named "Month YYYY" (e.g. "June 2026") are archive tabs
+const ARCHIVE_TAB_RE = /^(January|February|March|April|May|June|July|August|September|October|November|December) \d{4}$/;
+
 // ─── MONTHLY ARCHIVE ──────────────────────────────────────────────────────────
-async function archiveMonth() {
+// targetYear / targetMonthIdx (0-based) let us archive any past month.
+// Defaults to the previous calendar month.
+async function archiveMonth(targetYear, targetMonthIdx) {
   const sheets = getSheets();
   const now    = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Karachi" }));
 
-  // Archive previous month
-  const archiveDate = new Date(now.getFullYear(), now.getMonth() - 1, 1);
-  const monthName   = archiveDate.toLocaleString("en-US", { month: "long", year: "numeric" }); // e.g. "May 2026"
+  const archiveDate = (targetYear != null && targetMonthIdx != null)
+    ? new Date(targetYear, targetMonthIdx, 1)
+    : new Date(now.getFullYear(), now.getMonth() - 1, 1);
+
+  const monthName = archiveDate.toLocaleString("en-US", { month: "long", year: "numeric" });
+  const archM     = archiveDate.getMonth();    // 0-based
+  const archY     = archiveDate.getFullYear();
 
   const rows = await getRange(sheets, `${FUND_LOG_TAB}!A:J`);
   if (rows.length <= 1) { console.log("[DVA] Nothing to archive."); return; }
 
-  // Create archive tab if not exists
+  const header   = [rows[0]];
+  const allData  = rows.filter(r => r[0] && !isNaN(r[0]));
+
+  // Split rows: only archive entries that belong to the target month
+  const toArchive = [];
+  const toKeep    = [];
+  for (const r of allData) {
+    const parts  = (r[1] || "").split("/");   // stored as DD/MM/YYYY (en-PK)
+    const rMonth = parseInt(parts[1]) - 1;    // 0-based
+    const rYear  = parseInt(parts[2]);
+    if (rMonth === archM && rYear === archY) {
+      toArchive.push(r);
+    } else {
+      toKeep.push(r);
+    }
+  }
+
+  if (toArchive.length === 0) {
+    console.log(`[DVA] No entries found for ${monthName}, skipping.`);
+    return;
+  }
+
+  // Create archive tab if not exists and write archived rows
   const meta   = await getSheetMeta(sheets);
   const exists = meta.some(s => s.properties.title === monthName);
   if (!exists) await addTab(sheets, monthName);
-  await writeRange(sheets, `${monthName}!A1`, rows);
+  await writeRange(sheets, `${monthName}!A1`, [...header, ...toArchive]);
 
-  // Calc totals
-  const dataRows = rows.filter(r => r[0] && !isNaN(r[0]));
+  // Calc totals for archived rows only
   let niazai = 0, nomy = 0, silent = 0, volume = 0;
-  for (const r of dataRows) {
+  for (const r of toArchive) {
     niazai += parseFloat(r[2]) || 0;
     nomy   += parseFloat(r[3]) || 0;
     silent += parseFloat(r[4]) || 0;
@@ -194,12 +224,12 @@ async function archiveMonth() {
     ]);
   }
 
-  // Recalculate grand totals across all archive tabs
+  // Recalculate grand totals — only look at properly named archive tabs
   const allMeta = await getSheetMeta(sheets);
   let gtNiazai = 0, gtNomy = 0, gtSilent = 0, gtVolume = 0;
   for (const sheet of allMeta) {
     const t = sheet.properties.title;
-    if (t === FUND_LOG_TAB || t === MONTHLY_TAB) continue;
+    if (!ARCHIVE_TAB_RE.test(t)) continue;
     const archRows = await getRange(sheets, `${t}!A:J`);
     for (const r of archRows.filter(r => r[0] && !isNaN(r[0]))) {
       gtNiazai += parseFloat(r[2]) || 0;
@@ -214,13 +244,43 @@ async function archiveMonth() {
     ["DVA Volume", `$${gtVolume.toFixed(2)}`]
   ]);
 
-  // Clear Fund Log, keep headers
+  // Clear Fund Log and re-write any rows from other months that should stay
   await sheets.spreadsheets.values.clear({
     spreadsheetId: SHEET_ID,
     range: `${FUND_LOG_TAB}!A2:J1000`
   });
+  if (toKeep.length > 0) {
+    await writeRange(sheets, `${FUND_LOG_TAB}!A2`, toKeep);
+  }
   await updateSummaryBlock(sheets);
-  console.log(`[DVA] Archived ${monthName} successfully.`);
+  console.log(`[DVA] Archived ${monthName} (${toArchive.length} deal(s)). ${toKeep.length} row(s) kept in Fund Log.`);
+}
+
+// ─── STARTUP: catch any missed monthly archive ────────────────────────────────
+async function checkMissedArchive() {
+  const sheets    = getSheets();
+  const now       = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Karachi" }));
+  const thisMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+  const rows      = await getRange(sheets, `${FUND_LOG_TAB}!A:J`);
+  const dataRows  = rows.filter(r => r[0] && !isNaN(r[0]));
+
+  const pastMonths = new Set();
+  for (const r of dataRows) {
+    const parts  = (r[1] || "").split("/");
+    if (parts.length < 3) continue;
+    const rMonth = parseInt(parts[1]) - 1;
+    const rYear  = parseInt(parts[2]);
+    if (new Date(rYear, rMonth, 1) < thisMonth) {
+      pastMonths.add(`${rYear}:${rMonth}`);
+    }
+  }
+
+  for (const key of pastMonths) {
+    const [y, m] = key.split(":").map(Number);
+    const label  = new Date(y, m, 1).toLocaleString("en-US", { month: "long", year: "numeric" });
+    console.log(`[DVA] Missed archive detected: ${label}. Archiving now...`);
+    await archiveMonth(y, m);
+  }
 }
 
 // ─── CRON: midnight PKT (19:00 UTC), runs on 1st of month ────────────────────
@@ -574,6 +634,7 @@ process.on("uncaughtException",  err => console.error("[DVA] Uncaught exception:
 client.once("ready", async () => {
   console.log(`[DVA] Bot online as ${client.user.tag}`);
   await registerCommands();
+  await checkMissedArchive().catch(e => console.error("[DVA] Startup archive check error:", e));
 });
 
 client.login(process.env.BOT_TOKEN);
