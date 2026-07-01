@@ -284,13 +284,10 @@ async function checkMissedArchive() {
 }
 
 // ─── CRON: midnight PKT (19:00 UTC), runs on 1st of month ────────────────────
-cron.schedule("0 19 * * *", async () => {
-  const pkt = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Karachi" }));
-  if (pkt.getDate() === 1) {
-    console.log("[DVA] Running monthly archive...");
-    await archiveMonth().catch(e => console.error("[DVA] Archive error:", e));
-  }
-});
+cron.schedule("0 0 1 * *", async () => {
+  console.log("[DVA] Running monthly archive...");
+  await archiveMonth().catch(e => console.error("[DVA] Archive error:", e));
+}, { timezone: "Asia/Karachi" });
 
 // ─── DEAL PERSISTENCE ────────────────────────────────────────────────────────
 const fs        = require("fs");
