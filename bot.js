@@ -1,6 +1,6 @@
 // DVA Bot - bot.js
-// Version: 1.16
-// Last Modified: 2026-06-05
+// Version: 1.17
+// Last Modified: 2026-07-11
 // Dependencies: discord.js@14, googleapis, dotenv, node-cron
 // Install: npm install discord.js googleapis dotenv node-cron
 
@@ -34,15 +34,16 @@ const STAFF = {
 };
 
 // ─── ENV CONFIG ───────────────────────────────────────────────────────────────
-const DVA_CHANNEL_ID     = process.env.DVA_CHANNEL_ID;
-const DVA_TEMP_ROLE_ID   = process.env.DVA_TEMP_ROLE_ID;
-const BUYSELL_CHANNEL_ID = process.env.BUYSELL_CHANNEL_ID;
-const SHEET_ID           = process.env.SHEET_ID;
-const FUND_LOG_TAB       = process.env.SHEET_TAB || "Fund Log";
-const MONTHLY_TAB        = "Monthly Collection";
-const BOOSTER_MIN_MONTHS = 3;
-const BOOSTER_THRESHOLD  = 500;
-const STAFF_ROLE_ID      = "831157132346130492";
+const DVA_CHANNEL_ID      = process.env.DVA_CHANNEL_ID;
+const DVA_TEMP_ROLE_ID    = process.env.DVA_TEMP_ROLE_ID;
+const DVA_CASH_CHANNEL_ID  = process.env.DVA_CASH_CHANNEL_ID;
+const BUYSELL_CHANNEL_ID  = process.env.BUYSELL_CHANNEL_ID;
+const SHEET_ID            = process.env.SHEET_ID;
+const FUND_LOG_TAB        = process.env.SHEET_TAB || "Fund Log";
+const MONTHLY_TAB         = "Monthly Collection";
+const BOOSTER_MIN_MONTHS  = 3;
+const BOOSTER_THRESHOLD   = 500;
+const STAFF_ROLE_ID       = "831157132346130492";
 
 // ─── GOOGLE SHEETS AUTH ───────────────────────────────────────────────────────
 function getSheets() {
@@ -98,25 +99,31 @@ async function getNextDealId(sheets) {
 
 // ─── LOG DEAL TO FUND LOG ─────────────────────────────────────────────────────
 // Sheet columns: A=DealID | B=Date | C=Niazai | D=Nomy | E=SilentKiller | F=USDT Amount | G=Fee | H=Booster | I=Buyer | J=Seller
-async function logDeal(deal) {
-  const sheets    = getSheets();
-  const staffInfo = STAFF[deal.staffId];
-  const fee       = parseFloat((deal.amount * deal.feePercent / 100).toFixed(4));
-  const staffShare= parseFloat((fee * 0.5).toFixed(4));
-  const dealId    = await getNextDealId(sheets);
-  const now       = new Date().toLocaleDateString("en-PK", { timeZone: "Asia/Karachi" });
+// If closerStaffId is provided and differs from deal.staffId, the staff share is split 50/50 between them.
+async function logDeal(deal, closerStaffId) {
+  const sheets      = getSheets();
+  const starterInfo = STAFF[deal.staffId];
+  const fee         = parseFloat((deal.amount * deal.feePercent / 100).toFixed(4));
+  const dealId      = await getNextDealId(sheets);
+  const now         = new Date().toLocaleDateString("en-PK", { timeZone: "Asia/Karachi" });
 
-  // Columns: A=DealID, B=Date, C=Niazai, D=Nomy, E=SilentKiller, F=USDT Amount, G=Fee, H=Booster, I=Buyer, J=Seller
-  // colIndex: Niazai=1, Nomy=2, SilentKiller=3 → array index: C=2, D=3, E=4
   const row = Array(10).fill("");
-  row[0] = dealId;                          // A - Deal ID
-  row[1] = now;                             // B - Date
-  row[staffInfo.colIndex + 1] = staffShare; // C/D/E - staff share (colIndex 1→idx2, 2→idx3, 3→idx4)
-  row[5] = deal.amount;                     // F - USDT Amount
-  row[6] = fee;                             // G - Fee
-  row[7] = deal.booster ? `Yes (@${deal.boosterName})` : "No"; // H - Booster
-  row[8] = `${deal.buyerName} (${deal.buyerId})`;   // I - Buyer
-  row[9] = `${deal.sellerName} (${deal.sellerId})`; // J - Seller
+  row[0] = dealId;
+  row[1] = now;
+  row[5] = deal.amount;
+  row[6] = fee;
+  row[7] = deal.booster ? `Yes (@${deal.boosterName})` : "No";
+  row[8] = `${deal.buyerName} (${deal.buyerId})`;
+  row[9] = `${deal.sellerName} (${deal.sellerId})`;
+
+  if (closerStaffId && closerStaffId !== deal.staffId && STAFF[closerStaffId]) {
+    // Split: starter and closer each get 25% of the total fee
+    const halfShare = parseFloat((fee * 0.25).toFixed(4));
+    row[starterInfo.colIndex + 1]               = halfShare;
+    row[STAFF[closerStaffId].colIndex + 1]      = halfShare;
+  } else {
+    row[starterInfo.colIndex + 1] = parseFloat((fee * 0.5).toFixed(4));
+  }
 
   await appendRow(sheets, FUND_LOG_TAB, row);
   await updateSummaryBlock(sheets);
@@ -290,33 +297,34 @@ cron.schedule("0 0 1 * *", async () => {
 }, { timezone: "Asia/Karachi" });
 
 // ─── DEAL PERSISTENCE ────────────────────────────────────────────────────────
-const fs        = require("fs");
-const DEAL_FILE = "active_deal.json";
+const fs             = require("fs");
+const DEAL_FILE      = "active_deal.json";
+const CASH_DEAL_FILE = "active_cash_deal.json";
 const MAX_DEAL_AGE_HOURS = 24;
 
-function saveDeal(deal) {
+function saveDeal(deal, file) {
   try {
-    fs.writeFileSync(DEAL_FILE, JSON.stringify({ ...deal, savedAt: Date.now() }, null, 2));
+    fs.writeFileSync(file, JSON.stringify({ ...deal, savedAt: Date.now() }, null, 2));
   } catch (e) { console.error("[DVA] Failed to save deal:", e); }
 }
 
-function clearDealFile() {
+function clearDealFile(file) {
   try {
-    if (fs.existsSync(DEAL_FILE)) fs.unlinkSync(DEAL_FILE);
+    if (fs.existsSync(file)) fs.unlinkSync(file);
   } catch (e) { console.error("[DVA] Failed to clear deal file:", e); }
 }
 
-function loadDeal() {
+function loadDeal(file) {
   try {
-    if (!fs.existsSync(DEAL_FILE)) return null;
-    const deal = JSON.parse(fs.readFileSync(DEAL_FILE, "utf8"));
+    if (!fs.existsSync(file)) return null;
+    const deal = JSON.parse(fs.readFileSync(file, "utf8"));
     const ageHours = (Date.now() - deal.savedAt) / (1000 * 60 * 60);
     if (ageHours > MAX_DEAL_AGE_HOURS) {
-      console.log("[DVA] Stale deal found (>24hrs), discarding.");
-      clearDealFile();
+      console.log(`[DVA] Stale deal in ${file} (>24hrs), discarding.`);
+      clearDealFile(file);
       return null;
     }
-    console.log(`[DVA] Restored active deal from file (started by ${deal.staffId}).`);
+    console.log(`[DVA] Restored deal from ${file} (started by ${deal.staffId}).`);
     return deal;
   } catch (e) {
     console.error("[DVA] Failed to load deal file:", e);
@@ -324,9 +332,35 @@ function loadDeal() {
   }
 }
 
-// ─── ACTIVE DEAL (single global lock) ────────────────────────────────────────
-// Only one deal can run at a time across the entire server
-let activeDeal = loadDeal();
+// Central deal state: "normal" = #dva, "cash" = #dva-cash
+const dealState = {
+  normal: { deal: loadDeal(DEAL_FILE),      file: DEAL_FILE      },
+  cash:   { deal: loadDeal(CASH_DEAL_FILE),  file: CASH_DEAL_FILE }
+};
+
+// ─── CLOSE REMINDER ───────────────────────────────────────────────────────────
+// Pings staff in the correct DVA channel every 2 minutes after /dva release.
+const reminderIntervals = { normal: null, cash: null };
+
+function startCloseReminder(key) {
+  if (reminderIntervals[key]) return;
+  const channelId = key === "cash" ? DVA_CASH_CHANNEL_ID : DVA_CHANNEL_ID;
+  const staffId   = dealState[key].deal.staffId;
+  reminderIntervals[key] = setInterval(async () => {
+    try {
+      const guild   = client.guilds.cache.get(process.env.GUILD_ID);
+      const channel = guild?.channels.cache.get(channelId);
+      if (channel) await channel.send(`⏰ <@${staffId}> Please close the DVA using **/dva close**.`);
+    } catch (e) { console.error("[DVA] Reminder error:", e); }
+  }, 2 * 60 * 1000);
+}
+
+function stopCloseReminder(key) {
+  if (reminderIntervals[key]) {
+    clearInterval(reminderIntervals[key]);
+    reminderIntervals[key] = null;
+  }
+}
 
 // ─── DISCORD CLIENT ───────────────────────────────────────────────────────────
 const client = new Client({
@@ -349,6 +383,14 @@ const commands = [
       .setDescription("Start a new DVA deal")
       .addUserOption(o => o.setName("buyer").setDescription("Buyer").setRequired(true))
       .addUserOption(o => o.setName("seller").setDescription("Seller").setRequired(true))
+      .addStringOption(o => o
+        .setName("type")
+        .setDescription("Deal type — Normal (Binance) or Cash (Bank/F2F). Default: normal.")
+        .addChoices(
+          { name: "Normal",         value: "normal" },
+          { name: "Cash (Bank/F2F)", value: "cash"   }
+        )
+      )
     )
     .addSubcommand(s => s
       .setName("confirm")
@@ -357,7 +399,7 @@ const commands = [
     )
     .addSubcommand(s => s
       .setName("release")
-      .setDescription("Release escrow and log to Google Sheets")
+      .setDescription("Release escrow")
     )
     .addSubcommand(s => s
       .setName("close")
@@ -394,40 +436,56 @@ client.on("interactionCreate", async interaction => {
 
   if (!interaction.isChatInputCommand() || interaction.commandName !== "dva") return;
 
-  const sub        = interaction.options.getSubcommand();
-  const guild      = interaction.guild;
-  const channel    = interaction.channel;
-  const staffId    = interaction.user.id;
-  const dvaChannel = guild.channels.cache.get(DVA_CHANNEL_ID);
+  const sub     = interaction.options.getSubcommand();
+  const guild   = interaction.guild;
+  const channel = interaction.channel;
+  const staffId = interaction.user.id;
 
   if (!STAFF[staffId]) {
     return interaction.reply({ content: "❌ You are not authorized to use DVA commands.", ephemeral: true });
   }
 
-  // /dva start is allowed in #buy-sell OR #dva
-  // All other commands are locked to #dva only
+  // ── Channel guard ────────────────────────────────────────────────────────────
   if (sub === "start") {
-    if (channel.id !== DVA_CHANNEL_ID && channel.id !== BUYSELL_CHANNEL_ID) {
-      return interaction.reply({ content: `❌ DVA commands can only be used in <#${DVA_CHANNEL_ID}> or <#${BUYSELL_CHANNEL_ID}>.`, ephemeral: true });
+    if (channel.id !== DVA_CHANNEL_ID && channel.id !== BUYSELL_CHANNEL_ID && channel.id !== DVA_CASH_CHANNEL_ID) {
+      return interaction.reply({
+        content: `❌ DVA commands can only be used in <#${DVA_CHANNEL_ID}>, <#${DVA_CASH_CHANNEL_ID}>, or <#${BUYSELL_CHANNEL_ID}>.`,
+        ephemeral: true
+      });
     }
   } else {
-    if (channel.id !== DVA_CHANNEL_ID) {
-      return interaction.reply({ content: `❌ This command can only be used in <#${DVA_CHANNEL_ID}>.`, ephemeral: true });
+    if (channel.id !== DVA_CHANNEL_ID && channel.id !== DVA_CASH_CHANNEL_ID) {
+      return interaction.reply({
+        content: `❌ This command can only be used in <#${DVA_CHANNEL_ID}> or <#${DVA_CASH_CHANNEL_ID}>.`,
+        ephemeral: true
+      });
     }
   }
 
+  // ── Deal slot routing ────────────────────────────────────────────────────────
+  // For /dva start: type option picks the slot.
+  // For all other commands: the channel you run it in determines the slot.
+  const key = (sub === "start")
+    ? ((interaction.options.getString("type") || "normal") === "cash" ? "cash" : "normal")
+    : (channel.id === DVA_CASH_CHANNEL_ID ? "cash" : "normal");
+
+  const ctx        = dealState[key];
+  const dvaChanId  = key === "cash" ? DVA_CASH_CHANNEL_ID : DVA_CHANNEL_ID;
+  const dvaChannel = guild.channels.cache.get(dvaChanId);
+  const tempRoleId = DVA_TEMP_ROLE_ID;
+
   // ── /dva start ──────────────────────────────────────────────────────────────
   if (sub === "start") {
-    if (activeDeal) {
+    if (ctx.deal) {
       return interaction.reply({
-        content: `⚠️ A deal is already in progress (started by <@${activeDeal.staffId}>). Close or cancel it first.`,
+        content: `⚠️ A ${key} deal is already in progress (started by <@${ctx.deal.staffId}>). Close or cancel it first.`,
         ephemeral: true
       });
     }
 
     const buyer   = interaction.options.getMember("buyer");
     const seller  = interaction.options.getMember("seller");
-    const dvaRole = guild.roles.cache.get(DVA_TEMP_ROLE_ID);
+    const dvaRole = guild.roles.cache.get(tempRoleId);
 
     if (!dvaRole) return interaction.reply({ content: "❌ DVA-Temp role not found. Check your .env.", ephemeral: true });
 
@@ -439,7 +497,7 @@ client.on("interactionCreate", async interaction => {
     // Wait for Discord to propagate role assignment before sending message
     await new Promise(r => setTimeout(r, 2000));
 
-    activeDeal = {
+    ctx.deal = {
       staffId,
       buyerId:      buyer.id,
       buyerName:    buyer.user.username,
@@ -452,10 +510,10 @@ client.on("interactionCreate", async interaction => {
       boosterName:  null,
       released:     false
     };
-    saveDeal(activeDeal);
+    saveDeal(ctx.deal, ctx.file);
 
     await dvaChannel.send(
-      `<@&${DVA_TEMP_ROLE_ID}> — New DVA deal initiated by <@${staffId}>\n` +
+      `<@&${tempRoleId}> — New DVA deal initiated by <@${staffId}>\n` +
       `👤 **Buyer:** <@${buyer.id}> *(Buying USDT)*\n` +
       `👤 **Seller:** <@${seller.id}> *(Selling USDT)*\n\n` +
       `${STAFF[staffId].message}`
@@ -464,7 +522,7 @@ client.on("interactionCreate", async interaction => {
     const buySellChannel = guild.channels.cache.get(BUYSELL_CHANNEL_ID);
     if (buySellChannel) {
       await buySellChannel.send(
-        `🎯 <@${buyer.id}> & <@${seller.id}> — Please head over to <#${DVA_CHANNEL_ID}> to proceed.`
+        `🎯 <@${buyer.id}> & <@${seller.id}> — Please head over to <#${dvaChanId}> to proceed.`
       );
     }
 
@@ -473,100 +531,114 @@ client.on("interactionCreate", async interaction => {
 
   // ── /dva confirm ────────────────────────────────────────────────────────────
   if (sub === "confirm") {
-    if (!activeDeal)                    return interaction.reply({ content: "❌ No active deal.", ephemeral: true });
-    if (activeDeal.staffId !== staffId) return interaction.reply({ content: "❌ You didn't start this deal.", ephemeral: true });
+    if (!ctx.deal)                    return interaction.reply({ content: "❌ No active deal.", ephemeral: true });
+    if (ctx.deal.staffId !== staffId) return interaction.reply({ content: "❌ You didn't start this deal.", ephemeral: true });
 
-    const amount    = interaction.options.getNumber("amount");
-    activeDeal.amount = amount;
+    const amount      = interaction.options.getNumber("amount");
+    ctx.deal.amount   = amount;
 
     if (amount >= BOOSTER_THRESHOLD) {
-      const bMember = guild.members.cache.get(activeDeal.buyerId);
-      const sMember = guild.members.cache.get(activeDeal.sellerId);
+      const bMember = guild.members.cache.get(ctx.deal.buyerId);
+      const sMember = guild.members.cache.get(ctx.deal.sellerId);
       const bMonths = getBoosterMonths(bMember);
       const sMonths = getBoosterMonths(sMember);
       const booster = bMonths >= BOOSTER_MIN_MONTHS ? bMember
                     : sMonths >= BOOSTER_MIN_MONTHS ? sMember : null;
 
       if (booster) {
-        activeDeal.feePercent   = 0.5;
-        activeDeal.booster      = booster.id;
-        activeDeal.boosterName  = booster.user.username;
-        activeDeal.escrowAmount = parseFloat((amount - amount * 0.005).toFixed(4));
+        ctx.deal.feePercent   = 0.5;
+        ctx.deal.booster      = booster.id;
+        ctx.deal.boosterName  = booster.user.username;
+        ctx.deal.escrowAmount = parseFloat((amount - amount * 0.005).toFixed(4));
         await dvaChannel.send(
           `✅ ${amount} USDT received\n` +
-          `🔒 ${activeDeal.escrowAmount} USDT escrow\n\n` +
-          `🎉 Booster discount applied for <@${booster.id}> — Fee: **0.5%**`
+          `🔒 ${ctx.deal.escrowAmount} USDT escrow\n\n` +
+          `🎉 Booster discount applied for <@${booster.id}> — Fee: **0.5%**\n\n` +
+          `<@${ctx.deal.buyerId}> Please send funds to <@${ctx.deal.sellerId}>`
         );
       } else {
-        activeDeal.feePercent   = 1;
-        activeDeal.escrowAmount = parseFloat((amount - amount * 0.01).toFixed(4));
+        ctx.deal.feePercent   = 1;
+        ctx.deal.escrowAmount = parseFloat((amount - amount * 0.01).toFixed(4));
         await dvaChannel.send(
           `✅ ${amount} USDT received\n` +
-          `🔒 ${activeDeal.escrowAmount} USDT escrow\n\n` +
-          `📋 Fee: **1%**`
+          `🔒 ${ctx.deal.escrowAmount} USDT escrow\n\n` +
+          `📋 Fee: **1%**\n\n` +
+          `<@${ctx.deal.buyerId}> Please send funds to <@${ctx.deal.sellerId}>`
         );
       }
     } else {
-      activeDeal.feePercent   = 1;
-      activeDeal.escrowAmount = parseFloat((amount - amount * 0.01).toFixed(4));
+      ctx.deal.feePercent   = 1;
+      ctx.deal.escrowAmount = parseFloat((amount - amount * 0.01).toFixed(4));
       await dvaChannel.send(
         `✅ ${amount} USDT received\n` +
-        `🔒 ${activeDeal.escrowAmount} USDT escrow`
+        `🔒 ${ctx.deal.escrowAmount} USDT escrow\n\n` +
+        `<@${ctx.deal.buyerId}> Please send funds to <@${ctx.deal.sellerId}>`
       );
     }
-    saveDeal(activeDeal);
+    saveDeal(ctx.deal, ctx.file);
 
     return interaction.reply({ content: "✅ Escrow confirmed.", ephemeral: true });
   }
 
   // ── /dva release ────────────────────────────────────────────────────────────
   if (sub === "release") {
-    if (!activeDeal)                    return interaction.reply({ content: "❌ No active deal.", ephemeral: true });
-    if (activeDeal.staffId !== staffId) return interaction.reply({ content: "❌ You didn't start this deal.", ephemeral: true });
-    if (!activeDeal.escrowAmount)       return interaction.reply({ content: "❌ Run /dva confirm first.", ephemeral: true });
-    if (activeDeal.released)            return interaction.reply({ content: "⚠️ Escrow has already been released for this deal. Use **/dva close** to wrap up.", ephemeral: true });
+    if (!ctx.deal)                    return interaction.reply({ content: "❌ No active deal.", ephemeral: true });
+    if (ctx.deal.staffId !== staffId) return interaction.reply({ content: "❌ You didn't start this deal.", ephemeral: true });
+    if (!ctx.deal.escrowAmount)       return interaction.reply({ content: "❌ Run /dva confirm first.", ephemeral: true });
+    if (ctx.deal.released)            return interaction.reply({ content: "⚠️ Escrow has already been released for this deal. Use **/dva close** to wrap up.", ephemeral: true });
 
     await interaction.deferReply({ ephemeral: true });
 
     await dvaChannel.send(
       `✅ **Escrow Released!**\n` +
-      `💵 Amount: ${activeDeal.amount} USDT\n` +
-      `💸 Released: ${activeDeal.escrowAmount} USDT`
+      `💵 Amount: ${ctx.deal.amount} USDT\n` +
+      `💸 Released: ${ctx.deal.escrowAmount} USDT`
     );
 
-    await logDeal(activeDeal).catch(e => console.error("[DVA] Sheet log error:", e));
-    if (activeDeal) {
-      activeDeal.released = true;
-      saveDeal(activeDeal);
-    }
+    ctx.deal.released = true;
+    saveDeal(ctx.deal, ctx.file);
+    startCloseReminder(key);
 
-    return interaction.editReply({ content: "✅ Escrow released and logged to Google Sheets." });
+    return interaction.editReply({ content: "✅ Escrow released. Use **/dva close** to finalize and log to Sheets." });
   }
 
   // ── /dva close ──────────────────────────────────────────────────────────────
+  // Any staff member can close — acts as a safety override after /dva release.
+  // If a different staff closes, the sheet log splits the fee 50/50 between starter and closer.
   if (sub === "close") {
-    if (!activeDeal)                    return interaction.reply({ content: "❌ No active deal.", ephemeral: true });
-    if (activeDeal.staffId !== staffId) return interaction.reply({ content: "❌ You didn't start this deal.", ephemeral: true });
+    if (!ctx.deal) return interaction.reply({ content: "❌ No active deal.", ephemeral: true });
 
-    // Warn if escrow was confirmed but not released
-    if (activeDeal.escrowAmount && !activeDeal.released) {
+    // Block if escrow was confirmed but not yet released
+    if (ctx.deal.escrowAmount && !ctx.deal.released) {
       return interaction.reply({
-        content: `⚠️ Escrow of **${activeDeal.escrowAmount} USDT** has not been released yet.\nPlease run **/dva release** first, or run **/dva cancel** if the deal fell through.`,
+        content: `⚠️ Escrow of **${ctx.deal.escrowAmount} USDT** has not been released yet.\nPlease run **/dva release** first, or run **/dva cancel** if the deal fell through.`,
         ephemeral: true
       });
     }
 
     await interaction.deferReply({ ephemeral: true });
 
-    await dvaChannel.send(`======🙏 Thank you! DVA closed======`);
+    const isOverride   = staffId !== ctx.deal.staffId;
+    const closeMessage = isOverride
+      ? `======🙏 Thank you! DVA closed======\nDVA started by <@${ctx.deal.staffId}> — Closed by <@${staffId}>`
+      : `======🙏 Thank you! DVA closed======`;
 
-    const dealSnapshot = { ...activeDeal };
-    activeDeal = null;
-    clearDealFile();
+    await dvaChannel.send(closeMessage);
+
+    const dealSnapshot = { ...ctx.deal };
+    ctx.deal = null;
+    clearDealFile(ctx.file);
+    stopCloseReminder(key);
+
+    // Log to Sheets now that we know who closed (handles split if different staff)
+    if (dealSnapshot.released) {
+      const closerId = isOverride ? staffId : null;
+      await logDeal(dealSnapshot, closerId).catch(e => console.error("[DVA] Sheet log error:", e));
+    }
 
     setTimeout(async () => {
       try {
-        const dvaRole = guild.roles.cache.get(DVA_TEMP_ROLE_ID);
+        const dvaRole = guild.roles.cache.get(tempRoleId);
         const b = await guild.members.fetch(dealSnapshot.buyerId);
         const s = await guild.members.fetch(dealSnapshot.sellerId);
         await b.roles.remove(dvaRole);
@@ -576,30 +648,29 @@ client.on("interactionCreate", async interaction => {
 
     const buySellChannel = guild.channels.cache.get(BUYSELL_CHANNEL_ID);
     if (buySellChannel) {
-      await buySellChannel.send(
-        `🔔 Previous DVA has concluded. You may tag Staff again for DVA.`
-      );
+      await buySellChannel.send(`🔔 Previous DVA has concluded. You may tag Staff again for DVA.`);
     }
 
-    return interaction.editReply({ content: "✅ Deal closed. Roles will be removed in 5 seconds." });
+    return interaction.editReply({ content: "✅ Deal closed and logged to Google Sheets. Roles will be removed in 5 seconds." });
   }
 
   // ── /dva cancel ─────────────────────────────────────────────────────────────
   if (sub === "cancel") {
-    if (!activeDeal)                    return interaction.reply({ content: "❌ No active deal.", ephemeral: true });
-    if (activeDeal.staffId !== staffId) return interaction.reply({ content: "❌ You didn't start this deal.", ephemeral: true });
+    if (!ctx.deal)                    return interaction.reply({ content: "❌ No active deal.", ephemeral: true });
+    if (ctx.deal.staffId !== staffId) return interaction.reply({ content: "❌ You didn't start this deal.", ephemeral: true });
 
     await interaction.deferReply({ ephemeral: true });
 
     const reason       = interaction.options.getString("reason") || "No reason provided";
-    const dealSnapshot = { ...activeDeal };
-    activeDeal = null;
-    clearDealFile();
+    const dealSnapshot = { ...ctx.deal };
+    ctx.deal = null;
+    clearDealFile(ctx.file);
+    stopCloseReminder(key);
 
     await dvaChannel.send(`❌ DVA deal cancelled.\n📝 Reason: ${reason}`);
 
     try {
-      const dvaRole = guild.roles.cache.get(DVA_TEMP_ROLE_ID);
+      const dvaRole = guild.roles.cache.get(tempRoleId);
       const b = await guild.members.fetch(dealSnapshot.buyerId);
       const s = await guild.members.fetch(dealSnapshot.sellerId);
       await b.roles.remove(dvaRole);
@@ -611,12 +682,11 @@ client.on("interactionCreate", async interaction => {
 });
 
 // ─── STAFF MENTION LISTENER ───────────────────────────────────────────────────
-
 client.on("messageCreate", async message => {
   if (message.author.bot) return;
   if (message.channel.id !== BUYSELL_CHANNEL_ID) return;
   if (!message.mentions.roles.has(STAFF_ROLE_ID)) return;
-  if (!activeDeal) return;
+  if (!dealState.normal.deal && !dealState.cash.deal) return;
 
   await message.reply(
     `⏳ A DVA deal is currently in progress. Please wait and I will let you know once the ongoing deal is over.`
@@ -632,6 +702,14 @@ client.once("ready", async () => {
   console.log(`[DVA] Bot online as ${client.user.tag}`);
   await registerCommands();
   await checkMissedArchive().catch(e => console.error("[DVA] Startup archive check error:", e));
+
+  // Restart close reminders for any deals that were released but never closed before restart
+  for (const key of ["normal", "cash"]) {
+    if (dealState[key].deal?.released) {
+      console.log(`[DVA] Restarting close reminder for ${key} deal.`);
+      startCloseReminder(key);
+    }
+  }
 });
 
 client.login(process.env.BOT_TOKEN);
