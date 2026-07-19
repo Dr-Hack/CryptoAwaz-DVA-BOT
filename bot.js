@@ -1,6 +1,6 @@
 // DVA Bot - bot.js
-// Version: 1.17
-// Last Modified: 2026-07-11
+// Version: 1.18
+// Last Modified: 2026-07-19
 // Dependencies: discord.js@14, googleapis, dotenv, node-cron
 // Install: npm install discord.js googleapis dotenv node-cron
 
@@ -34,10 +34,11 @@ const STAFF = {
 };
 
 // ─── ENV CONFIG ───────────────────────────────────────────────────────────────
-const DVA_CHANNEL_ID      = process.env.DVA_CHANNEL_ID;
-const DVA_TEMP_ROLE_ID    = process.env.DVA_TEMP_ROLE_ID;
-const DVA_CASH_CHANNEL_ID  = process.env.DVA_CASH_CHANNEL_ID;
-const BUYSELL_CHANNEL_ID  = process.env.BUYSELL_CHANNEL_ID;
+const DVA_CHANNEL_ID        = process.env.DVA_CHANNEL_ID;
+const DVA_TEMP_ROLE_ID      = process.env.DVA_TEMP_ROLE_ID;
+const DVA_CASH_CHANNEL_ID   = process.env.DVA_CASH_CHANNEL_ID;
+const DVA_CASH_TEMP_ROLE_ID = process.env.DVA_CASH_TEMP_ROLE_ID;
+const BUYSELL_CHANNEL_ID    = process.env.BUYSELL_CHANNEL_ID;
 const SHEET_ID            = process.env.SHEET_ID;
 const FUND_LOG_TAB        = process.env.SHEET_TAB || "Fund Log";
 const MONTHLY_TAB         = "Monthly Collection";
@@ -95,6 +96,14 @@ async function getNextDealId(sheets) {
   const rows = await getRange(sheets, `${FUND_LOG_TAB}!A:A`);
   const ids  = rows.filter(r => r[0] && !isNaN(r[0])).map(r => parseInt(r[0]));
   return ids.length > 0 ? Math.max(...ids) + 1 : 1;
+}
+
+// ─── AMOUNT DISPLAY HELPER ────────────────────────────────────────────────────
+function formatAmountDisplay(deal) {
+  if (deal.amounts && deal.amounts.length > 1) {
+    return `${deal.amounts.join("+")} : ${deal.amount}`;
+  }
+  return `${deal.amount}`;
 }
 
 // ─── LOG DEAL TO FUND LOG ─────────────────────────────────────────────────────
@@ -398,6 +407,11 @@ const commands = [
       .addNumberOption(o => o.setName("amount").setDescription("USDT amount received").setRequired(true))
     )
     .addSubcommand(s => s
+      .setName("confirm-update")
+      .setDescription("Add more USDT to the current deal escrow")
+      .addNumberOption(o => o.setName("amount").setDescription("Additional USDT amount").setRequired(true))
+    )
+    .addSubcommand(s => s
       .setName("release")
       .setDescription("Release escrow")
     )
@@ -472,7 +486,7 @@ client.on("interactionCreate", async interaction => {
   const ctx        = dealState[key];
   const dvaChanId  = key === "cash" ? DVA_CASH_CHANNEL_ID : DVA_CHANNEL_ID;
   const dvaChannel = guild.channels.cache.get(dvaChanId);
-  const tempRoleId = DVA_TEMP_ROLE_ID;
+  const tempRoleId = key === "cash" ? DVA_CASH_TEMP_ROLE_ID : DVA_TEMP_ROLE_ID;
 
   // ── /dva start ──────────────────────────────────────────────────────────────
   if (sub === "start") {
@@ -504,6 +518,7 @@ client.on("interactionCreate", async interaction => {
       sellerId:     seller.id,
       sellerName:   seller.user.username,
       amount:       null,
+      amounts:      null,
       feePercent:   null,
       escrowAmount: null,
       booster:      null,
@@ -536,6 +551,7 @@ client.on("interactionCreate", async interaction => {
 
     const amount      = interaction.options.getNumber("amount");
     ctx.deal.amount   = amount;
+    ctx.deal.amounts  = [amount];
 
     if (amount >= BOOSTER_THRESHOLD) {
       const bMember = guild.members.cache.get(ctx.deal.buyerId);
@@ -580,6 +596,34 @@ client.on("interactionCreate", async interaction => {
     return interaction.reply({ content: "✅ Escrow confirmed.", ephemeral: true });
   }
 
+  // ── /dva confirm-update ─────────────────────────────────────────────────────
+  if (sub === "confirm-update") {
+    if (!ctx.deal)                    return interaction.reply({ content: "❌ No active deal.", ephemeral: true });
+    if (ctx.deal.staffId !== staffId) return interaction.reply({ content: "❌ You didn't start this deal.", ephemeral: true });
+    if (!ctx.deal.feePercent)         return interaction.reply({ content: "❌ Run /dva confirm first.", ephemeral: true });
+    if (ctx.deal.released)            return interaction.reply({ content: "⚠️ Escrow already released. Cannot update amount.", ephemeral: true });
+
+    const addAmount = interaction.options.getNumber("amount");
+
+    // Graceful backward compat: if amounts wasn't stored (old deal), seed it now
+    if (!ctx.deal.amounts) ctx.deal.amounts = [ctx.deal.amount];
+
+    ctx.deal.amounts.push(addAmount);
+    ctx.deal.amount      = parseFloat((ctx.deal.amount + addAmount).toFixed(4));
+    const feePct         = ctx.deal.feePercent / 100;
+    ctx.deal.escrowAmount = parseFloat((ctx.deal.amount * (1 - feePct)).toFixed(4));
+
+    const amountDisplay = formatAmountDisplay(ctx.deal);
+    await dvaChannel.send(
+      `✅ ${amountDisplay} USDT received\n` +
+      `🔒 ${ctx.deal.escrowAmount} USDT escrow\n\n` +
+      `<@${ctx.deal.buyerId}> Please send funds to <@${ctx.deal.sellerId}>`
+    );
+    saveDeal(ctx.deal, ctx.file);
+
+    return interaction.reply({ content: "✅ Escrow amount updated.", ephemeral: true });
+  }
+
   // ── /dva release ────────────────────────────────────────────────────────────
   if (sub === "release") {
     if (!ctx.deal)                    return interaction.reply({ content: "❌ No active deal.", ephemeral: true });
@@ -591,7 +635,7 @@ client.on("interactionCreate", async interaction => {
 
     await dvaChannel.send(
       `✅ **Escrow Released!**\n` +
-      `💵 Amount: ${ctx.deal.amount} USDT\n` +
+      `💵 Amount: ${formatAmountDisplay(ctx.deal)} USDT\n` +
       `💸 Released: ${ctx.deal.escrowAmount} USDT`
     );
 
