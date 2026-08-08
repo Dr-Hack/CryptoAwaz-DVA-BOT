@@ -245,7 +245,7 @@ async function archiveMonth(targetYear, targetMonthIdx) {
 
   // Recalculate grand totals — only look at properly named archive tabs
   const allMeta = await getSheetMeta(sheets);
-  let gtNiazai = 0, gtNomy = 0, gtSilent = 0, gtVolume = 0;
+  let gtNiazai = 0, gtNomy = 0, gtSilent = 0;
   for (const sheet of allMeta) {
     const t = sheet.properties.title;
     if (!ARCHIVE_TAB_RE.test(t)) continue;
@@ -254,10 +254,17 @@ async function archiveMonth(targetYear, targetMonthIdx) {
       gtNiazai += parseFloat(r[2]) || 0;
       gtNomy   += parseFloat(r[3]) || 0;
       gtSilent += parseFloat(r[4]) || 0;
-      gtVolume += parseFloat(r[5]) || 0;
     }
   }
   const gtTotal = gtNiazai + gtNomy + gtSilent;
+
+  // DVA Volume — read G column from Monthly Collection directly so all months are included
+  const mcGRows = await getRange(sheets, `${MONTHLY_TAB}!G:G`);
+  const gtVolume = mcGRows.reduce((s, r) => {
+    const v = parseFloat(r[0]);
+    return s + (isNaN(v) ? 0 : v);
+  }, 0);
+
   await writeRange(sheets, `${MONTHLY_TAB}!K2:L3`, [
     ["G. Total",   `$${gtTotal.toFixed(2)}`],
     ["DVA Volume", `$${gtVolume.toFixed(2)}`]
