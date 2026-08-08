@@ -45,6 +45,7 @@ const MONTHLY_TAB         = "Monthly Collection";
 const BOOSTER_MIN_MONTHS  = 3;
 const BOOSTER_THRESHOLD   = 500;
 const STAFF_ROLE_ID       = "831157132346130492";
+const MONTH_NAMES         = ["January","February","March","April","May","June","July","August","September","October","November","December"];
 
 // ─── GOOGLE SHEETS AUTH ───────────────────────────────────────────────────────
 function getSheets() {
@@ -272,6 +273,24 @@ async function archiveMonth(targetYear, targetMonthIdx) {
   }
   await updateSummaryBlock(sheets);
   console.log(`[DVA] Archived ${monthName} (${toArchive.length} deal(s)). ${toKeep.length} row(s) kept in Fund Log.`);
+
+  // Post monthly summary to buy-sell channel
+  try {
+    const boosterRows = toArchive.filter(r => (r[7] || "").startsWith("Yes"));
+    const savings     = parseFloat(boosterRows.reduce((s, r) => s + (parseFloat(r[6]) || 0), 0).toFixed(4));
+    const members     = new Set([
+      ...toArchive.map(r => r[8]).filter(Boolean),
+      ...toArchive.map(r => r[9]).filter(Boolean)
+    ]).size;
+    const guild   = client.guilds.cache.get(process.env.GUILD_ID);
+    const buySell = guild?.channels.cache.get(BUYSELL_CHANNEL_ID);
+    if (buySell) await buySell.send(
+      `📊 **DVA Monthly Summary — ${monthName}**\n\n` +
+      `In the month of **${monthName}**, a total of **${toArchive.length}** deals happened worth **$${volume.toFixed(2)} USDT**. ` +
+      `**${members}** members utilized DVA while **${boosterRows.length}** booster members saved **$${savings} USDT** ` +
+      `in DVA fee because of boosting! 🚀`
+    );
+  } catch (e) { console.error("[DVA] Failed to post monthly summary:", e); }
 }
 
 // ─── STARTUP: catch any missed monthly archive ────────────────────────────────
@@ -454,6 +473,10 @@ const commands = [
       .addStringOption(o => o.setName("reason").setDescription("Reason (optional)"))
     )
     .addSubcommand(s => s
+      .setName("stats")
+      .setDescription("Show DVA stats for last completed month and last 7 days")
+    )
+    .addSubcommand(s => s
       .setName("discount")
       .setDescription("Start a server booster discount campaign (Niazai only)")
       .addIntegerOption(o => o.setName("boost_since")
@@ -486,6 +509,56 @@ function getBoosterDays(member) {
   return (Date.now() - member.premiumSince.getTime()) / (1000 * 60 * 60 * 24);
 }
 
+// ─── STATS HELPERS ────────────────────────────────────────────────────────────
+function parseArchiveDate(title) {
+  const [month, year] = title.split(" ");
+  return new Date(parseInt(year), MONTH_NAMES.indexOf(month), 1);
+}
+
+function calcStats(rows) {
+  const volume      = rows.reduce((s, r) => s + (parseFloat(r[5]) || 0), 0);
+  const boosterRows = rows.filter(r => (r[7] || "").startsWith("Yes"));
+  const savings     = boosterRows.reduce((s, r) => s + (parseFloat(r[6]) || 0), 0);
+  const members     = new Set([
+    ...rows.map(r => r[8]).filter(Boolean),
+    ...rows.map(r => r[9]).filter(Boolean)
+  ]).size;
+  return {
+    deals:        rows.length,
+    volume:       parseFloat(volume.toFixed(2)),
+    members,
+    boosterDeals: boosterRows.length,
+    savings:      parseFloat(savings.toFixed(4))
+  };
+}
+
+async function getLastMonthStats() {
+  const sheets = getSheets();
+  const meta   = await getSheetMeta(sheets);
+  const tabs   = meta
+    .map(s => s.properties.title)
+    .filter(t => ARCHIVE_TAB_RE.test(t))
+    .sort((a, b) => parseArchiveDate(b) - parseArchiveDate(a));
+  if (tabs.length === 0) return null;
+  const rows = await getRange(sheets, `${tabs[0]}!A:J`);
+  return { label: tabs[0], ...calcStats(rows.filter(r => r[0] && !isNaN(r[0]))) };
+}
+
+async function getLast7DaysStats() {
+  const sheets  = getSheets();
+  const rows    = await getRange(sheets, `${FUND_LOG_TAB}!A:J`);
+  const cutoff  = Date.now() - 7 * 24 * 60 * 60 * 1000;
+  const recent  = rows.filter(r => {
+    if (!r[0] || isNaN(r[0])) return false;
+    const [d, m, y] = (r[1] || "").split("/").map(Number);
+    return !isNaN(d) && new Date(y, m - 1, d).getTime() >= cutoff;
+  });
+  const now = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Karachi" }));
+  const from = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+  const fmt  = d => d.toLocaleDateString("en-PK", { day: "numeric", month: "short", timeZone: "Asia/Karachi" });
+  return { label: `${fmt(from)} – ${fmt(now)}`, ...calcStats(recent) };
+}
+
 // ─── INTERACTION HANDLER ──────────────────────────────────────────────────────
 client.on("interactionCreate", async interaction => {
   if (interaction.isChatInputCommand() && interaction.commandName === "fee") {
@@ -498,6 +571,30 @@ client.on("interactionCreate", async interaction => {
   const guild   = interaction.guild;
   const channel = interaction.channel;
   const staffId = interaction.user.id;
+
+  // ── /dva stats — open to everyone ───────────────────────────────────────────
+  if (sub === "stats") {
+    if (channel.id !== DVA_CHANNEL_ID && channel.id !== DVA_CASH_CHANNEL_ID && channel.id !== BUYSELL_CHANNEL_ID) {
+      return interaction.reply({
+        content: `❌ This command can only be used in <#${DVA_CHANNEL_ID}> or <#${BUYSELL_CHANNEL_ID}>.`,
+        ephemeral: true
+      });
+    }
+    await interaction.deferReply();
+    const [last, week] = await Promise.all([getLastMonthStats(), getLast7DaysStats()]);
+    const lines = ["📊 **DVA Stats**\n"];
+    if (last) lines.push(
+      `📅 **Last Completed Month — ${last.label}**\n` +
+      `• ${last.deals} deals · $${last.volume.toFixed(2)} USDT\n` +
+      `• ${last.members} members · ${last.boosterDeals} booster deals saved $${last.savings} USDT in fee`
+    );
+    lines.push(
+      `\n📈 **Last 7 Days (${week.label})**\n` +
+      `• ${week.deals} deals · $${week.volume.toFixed(2)} USDT\n` +
+      `• ${week.members} members · ${week.boosterDeals} booster deals saved $${week.savings} USDT in fee`
+    );
+    return interaction.editReply(lines.join("\n"));
+  }
 
   if (!STAFF[staffId]) {
     return interaction.reply({ content: "❌ You are not authorized to use DVA commands.", ephemeral: true });
