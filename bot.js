@@ -1,6 +1,6 @@
 // DVA Bot - bot.js
-// Version: 1.18
-// Last Modified: 2026-07-19
+// Version: 1.20
+// Last Modified: 2026-08-08
 // Dependencies: discord.js@14, googleapis, dotenv, node-cron
 // Install: npm install discord.js googleapis dotenv node-cron
 
@@ -258,7 +258,7 @@ async function archiveMonth(targetYear, targetMonthIdx) {
     }
   }
   const gtTotal = gtNiazai + gtNomy + gtSilent;
-  await writeRange(sheets, `${MONTHLY_TAB}!H2:I3`, [
+  await writeRange(sheets, `${MONTHLY_TAB}!K2:L3`, [
     ["G. Total",   `$${gtTotal.toFixed(2)}`],
     ["DVA Volume", `$${gtVolume.toFixed(2)}`]
   ]);
@@ -287,7 +287,7 @@ async function archiveMonth(targetYear, targetMonthIdx) {
     if (buySell) await buySell.send(
       `📊 **DVA Monthly Summary — ${monthName}**\n\n` +
       `In the month of **${monthName}**, a total of **${toArchive.length}** deals happened worth **$${volume.toFixed(2)} USDT**. ` +
-      `**${members}** members utilized DVA while **${boosterRows.length}** booster members saved **$${savings} USDT** ` +
+      `**${members}** members utilized DVA while **${boosterRows.length}** booster members saved **$${savings.toFixed(2)} USDT** ` +
       `in DVA fee because of boosting! 🚀`
     );
   } catch (e) { console.error("[DVA] Failed to post monthly summary:", e); }
@@ -586,12 +586,12 @@ client.on("interactionCreate", async interaction => {
     if (last) lines.push(
       `📅 **Last Completed Month — ${last.label}**\n` +
       `• ${last.deals} deals · $${last.volume.toFixed(2)} USDT\n` +
-      `• ${last.members} members · ${last.boosterDeals} booster deals saved $${last.savings} USDT in fee`
+      `• ${last.members} members · ${last.boosterDeals} booster deals saved $${last.savings.toFixed(2)} USDT in fee`
     );
     lines.push(
       `\n📈 **Last 7 Days (${week.label})**\n` +
       `• ${week.deals} deals · $${week.volume.toFixed(2)} USDT\n` +
-      `• ${week.members} members · ${week.boosterDeals} booster deals saved $${week.savings} USDT in fee`
+      `• ${week.members} members · ${week.boosterDeals} booster deals saved $${week.savings.toFixed(2)} USDT in fee`
     );
     return interaction.editReply(lines.join("\n"));
   }
