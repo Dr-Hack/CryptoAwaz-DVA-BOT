@@ -608,7 +608,7 @@ client.on("interactionCreate", async interaction => {
     if (buySellChannel) {
       await buySellChannel.send(
         `🎉 **Special DVA Discount Campaign!**\n\n` +
-        `Server boosters who have been boosting for **${boostSinceDays}+ days** get a **0.5% DVA fee** instead of the standard 1%!\n\n` +
+        `Server boosters who have been boosting for **${boostSinceDays}+ days** get a **0.5% DVA fee** instead of the standard 1% — for deals of **500+ USDT**!\n\n` +
         `📅 Campaign ends: **${endsDate}**\n` +
         `Use **/fee** to calculate your deal fee.`
       );
@@ -635,8 +635,8 @@ client.on("interactionCreate", async interaction => {
     let boosterMember = null;
     let discountTag   = null;
 
-    // Campaign check first — lower threshold, no amount minimum
-    if (isCampaignActive()) {
+    // Campaign check first — lower boosting-days threshold, same 500 USDT minimum
+    if (isCampaignActive() && amount >= BOOSTER_THRESHOLD) {
       const bDays = getBoosterDays(bMember);
       const sDays = getBoosterDays(sMember);
       boosterMember = bDays >= discountCampaign.boostSinceDays ? bMember
