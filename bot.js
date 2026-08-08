@@ -224,9 +224,10 @@ async function archiveMonth(targetYear, targetMonthIdx) {
   let updated  = false;
   for (let i = 1; i < mcRows.length; i++) {
     if (mcRows[i][0] === monthName) {
-      await writeRange(sheets, `${MONTHLY_TAB}!C${i + 1}:F${i + 1}`, [[
+      await writeRange(sheets, `${MONTHLY_TAB}!C${i + 1}:G${i + 1}`, [[
         `$${niazai.toFixed(2)}`, `$${nomy.toFixed(2)}`,
-        `$${silent.toFixed(2)}`, `$${monthlyTotal.toFixed(2)}`
+        `$${silent.toFixed(2)}`, `$${monthlyTotal.toFixed(2)}`,
+        parseFloat(volume.toFixed(2))
       ]]);
       updated = true;
       break;
@@ -236,7 +237,8 @@ async function archiveMonth(targetYear, targetMonthIdx) {
     await appendRow(sheets, MONTHLY_TAB, [
       "", monthName,
       `$${niazai.toFixed(2)}`, `$${nomy.toFixed(2)}`,
-      `$${silent.toFixed(2)}`, `$${monthlyTotal.toFixed(2)}`
+      `$${silent.toFixed(2)}`, `$${monthlyTotal.toFixed(2)}`,
+      parseFloat(volume.toFixed(2))
     ]);
   }
 
