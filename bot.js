@@ -1,5 +1,5 @@
 // DVA Bot - bot.js
-// Version: 1.22
+// Version: 1.23
 // Last Modified: 2026-08-09
 // Dependencies: discord.js@14, googleapis, dotenv, node-cron
 // Install: npm install discord.js googleapis dotenv node-cron
@@ -286,9 +286,8 @@ async function archiveMonth(targetYear, targetMonthIdx) {
     const buySell = guild?.channels.cache.get(BUYSELL_CHANNEL_ID);
     if (buySell) await buySell.send(
       `📊 **DVA Monthly Summary — ${monthName}**\n\n` +
-      `In the month of **${monthName}**, a total of **${toArchive.length}** deals happened worth **$${volume.toFixed(2)} USDT**. ` +
-      `**${members}** members utilized DVA while **${boosterRows.length}** booster members saved **$${savings.toFixed(2)} USDT** ` +
-      `in DVA fee because of boosting! 🚀`
+      `**${monthName}** is a wrap! **${toArchive.length} deals** closed safely with **$${volume.toFixed(2)} USDT** exchanged across **${members} members** this month. ` +
+      `**${boosterRows.length} Boosters** also played it smart — pocketing **$${savings.toFixed(2)}** back in DVA fee savings. See you next month! 🚀`
     );
   } catch (e) { console.error("[DVA] Failed to post monthly summary:", e); }
 }
