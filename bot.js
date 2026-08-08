@@ -594,13 +594,13 @@ client.on("interactionCreate", async interaction => {
     const lines = ["📊 **DVA Stats**\n"];
     if (last) lines.push(
       `📅 **Last Completed Month — ${last.label}**\n` +
-      `• ${last.deals} deals · $${last.volume.toFixed(2)} USDT\n` +
-      `• ${last.members} members (${last.boosterDeals} boosters saved $${last.savings.toFixed(2)} USDT in fee)`
+      `${last.label} wrapped up with **${last.deals} deals** safely closed and **$${last.volume.toFixed(2)} USDT** exchanged across **${last.members} members**. ` +
+      `On top of that, **${last.boosterDeals} Boosters** kept a little extra in their pockets — saving **$${last.savings.toFixed(2)}** in DVA fees. A solid month. ✅`
     );
     lines.push(
       `\n📈 **Last 7 Days (${week.label})**\n` +
-      `• ${week.deals} deals · $${week.volume.toFixed(2)} USDT\n` +
-      `• ${week.members} members (${week.boosterDeals} boosters saved $${week.savings.toFixed(2)} USDT in fee)`
+      `Another week, another **$${week.volume.toFixed(2)} USDT** safely exchanged. **${week.members} members** trusted the process with **${week.deals} deals** going smooth — ` +
+      `and **${week.boosterDeals} Boosters** looked extra smart saving **$${week.savings.toFixed(2)}** in fees while everyone else paid full rate. 👀`
     );
     lines.push(`\n🗓️ **Since January 2025**\n• $${allTimeVol.toFixed(2)} USDT total volume`);
     return interaction.editReply(lines.join("\n"));
