@@ -1,6 +1,6 @@
 // DVA Bot - bot.js
-// Version: 1.21
-// Last Modified: 2026-08-08
+// Version: 1.22
+// Last Modified: 2026-08-09
 // Dependencies: discord.js@14, googleapis, dotenv, node-cron
 // Install: npm install discord.js googleapis dotenv node-cron
 
