@@ -243,31 +243,22 @@ async function archiveMonth(targetYear, targetMonthIdx) {
     ]);
   }
 
-  // Recalculate grand totals — only look at properly named archive tabs
-  const allMeta = await getSheetMeta(sheets);
-  let gtNiazai = 0, gtNomy = 0, gtSilent = 0;
-  for (const sheet of allMeta) {
-    const t = sheet.properties.title;
-    if (!ARCHIVE_TAB_RE.test(t)) continue;
-    const archRows = await getRange(sheets, `${t}!A:J`);
-    for (const r of archRows.filter(r => r[0] && !isNaN(r[0]))) {
-      gtNiazai += parseFloat(r[2]) || 0;
-      gtNomy   += parseFloat(r[3]) || 0;
-      gtSilent += parseFloat(r[4]) || 0;
-    }
-  }
-  const gtTotal = gtNiazai + gtNomy + gtSilent;
-
-  // DVA Volume — read G column from Monthly Collection directly so all months are included
-  const mcGRows = await getRange(sheets, `${MONTHLY_TAB}!G:G`);
-  const gtVolume = mcGRows.reduce((s, r) => {
-    const v = parseFloat(r[0]);
+  // Total Fee + DVA Volume — read F and G columns from Monthly Collection directly
+  // so all months (including pre-archive history) are included in the grand totals
+  const [mcFRows, mcGRows] = await Promise.all([
+    getRange(sheets, `${MONTHLY_TAB}!F:F`),
+    getRange(sheets, `${MONTHLY_TAB}!G:G`)
+  ]);
+  const sumCol = rows => rows.reduce((s, r) => {
+    const v = parseFloat((r[0] || "").toString().replace(/[$,]/g, ""));
     return s + (isNaN(v) ? 0 : v);
   }, 0);
+  const gtTotal  = sumCol(mcFRows);
+  const gtVolume = sumCol(mcGRows);
 
   await writeRange(sheets, `${MONTHLY_TAB}!K2:L3`, [
-    ["G. Total",   `$${gtTotal.toFixed(2)}`],
-    ["DVA Volume", `$${gtVolume.toFixed(2)}`]
+    ["Total Fee",   `$${gtTotal.toFixed(2)}`],
+    ["DVA Volume",  `$${gtVolume.toFixed(2)}`]
   ]);
 
   // Clear Fund Log and re-write any rows from other months that should stay
