@@ -1,5 +1,5 @@
 // DVA Bot - bot.js
-// Version: 1.20
+// Version: 1.21
 // Last Modified: 2026-08-08
 // Dependencies: discord.js@14, googleapis, dotenv, node-cron
 // Install: npm install discord.js googleapis dotenv node-cron
@@ -249,7 +249,7 @@ async function archiveMonth(targetYear, targetMonthIdx) {
     getRange(sheets, `${MONTHLY_TAB}!F:F`),
     getRange(sheets, `${MONTHLY_TAB}!G:G`)
   ]);
-  const sumCol = rows => rows.reduce((s, r) => {
+  const sumCol = col => col.reduce((s, r) => {
     const v = parseFloat((r[0] || "").toString().replace(/[$,]/g, ""));
     return s + (isNaN(v) ? 0 : v);
   }, 0);
