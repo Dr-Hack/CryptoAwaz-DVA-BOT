@@ -347,6 +347,33 @@ const dealState = {
   cash:   { deal: loadDeal(CASH_DEAL_FILE),  file: CASH_DEAL_FILE }
 };
 
+// ─── DISCOUNT CAMPAIGN PERSISTENCE ───────────────────────────────────────────
+const CAMPAIGN_FILE = "discount_campaign.json";
+
+function loadCampaignFile() {
+  try {
+    if (!fs.existsSync(CAMPAIGN_FILE)) return null;
+    const c = JSON.parse(fs.readFileSync(CAMPAIGN_FILE, "utf8"));
+    if (Date.now() >= c.endsAt) { fs.unlinkSync(CAMPAIGN_FILE); return null; }
+    console.log(`[DVA] Active discount campaign restored (boost_since: ${c.boostSinceDays}d, ends: ${new Date(c.endsAt).toLocaleDateString("en-PK", { timeZone: "Asia/Karachi" })}).`);
+    return c;
+  } catch (e) { return null; }
+}
+
+function saveCampaignFile(campaign) {
+  fs.writeFileSync(CAMPAIGN_FILE, JSON.stringify(campaign, null, 2));
+}
+
+function clearCampaignFile() {
+  try { if (fs.existsSync(CAMPAIGN_FILE)) fs.unlinkSync(CAMPAIGN_FILE); } catch (_) {}
+}
+
+let discountCampaign = loadCampaignFile();
+
+function isCampaignActive() {
+  return discountCampaign && Date.now() < discountCampaign.endsAt;
+}
+
 // ─── CLOSE REMINDER ───────────────────────────────────────────────────────────
 // Pings staff in the correct DVA channel every 2 minutes after /dva release.
 const reminderIntervals = { normal: null, cash: null };
@@ -423,6 +450,16 @@ const commands = [
       .setName("cancel")
       .setDescription("Cancel the current deal")
       .addStringOption(o => o.setName("reason").setDescription("Reason (optional)"))
+    )
+    .addSubcommand(s => s
+      .setName("discount")
+      .setDescription("Start a server booster discount campaign (Niazai only)")
+      .addIntegerOption(o => o.setName("boost_since")
+        .setDescription("Minimum days the member has been boosting to qualify")
+        .setRequired(true).setMinValue(1))
+      .addIntegerOption(o => o.setName("duration")
+        .setDescription("Campaign duration in days")
+        .setRequired(true).setMinValue(1).setMaxValue(90))
     ),
   feeCommand.data
 ].map(c => c.toJSON());
@@ -438,8 +475,13 @@ async function registerCommands() {
 
 // ─── BOOSTER CHECK ────────────────────────────────────────────────────────────
 function getBoosterMonths(member) {
-  if (!member.premiumSince) return 0;
+  if (!member?.premiumSince) return 0;
   return (Date.now() - member.premiumSince.getTime()) / (1000 * 60 * 60 * 24 * 30);
+}
+
+function getBoosterDays(member) {
+  if (!member?.premiumSince) return 0;
+  return (Date.now() - member.premiumSince.getTime()) / (1000 * 60 * 60 * 24);
 }
 
 // ─── INTERACTION HANDLER ──────────────────────────────────────────────────────
@@ -460,7 +502,7 @@ client.on("interactionCreate", async interaction => {
   }
 
   // ── Channel guard ────────────────────────────────────────────────────────────
-  if (sub === "start") {
+  if (sub === "start" || sub === "discount") {
     if (channel.id !== DVA_CHANNEL_ID && channel.id !== BUYSELL_CHANNEL_ID && channel.id !== DVA_CASH_CHANNEL_ID) {
       return interaction.reply({
         content: `❌ DVA commands can only be used in <#${DVA_CHANNEL_ID}>, <#${DVA_CASH_CHANNEL_ID}>, or <#${BUYSELL_CHANNEL_ID}>.`,
@@ -544,6 +586,40 @@ client.on("interactionCreate", async interaction => {
     return interaction.editReply({ content: `✅ Deal started. DVA-Temp assigned to <@${buyer.id}> and <@${seller.id}>.` });
   }
 
+  // ── /dva discount ────────────────────────────────────────────────────────────
+  if (sub === "discount") {
+    const NIAZAI_ID = "377834469656100865";
+    if (staffId !== NIAZAI_ID) {
+      return interaction.reply({ content: "❌ Only Niazai can manage discount campaigns.", ephemeral: true });
+    }
+
+    const boostSinceDays = interaction.options.getInteger("boost_since");
+    const durationDays   = interaction.options.getInteger("duration");
+    const endsAt         = Date.now() + durationDays * 24 * 60 * 60 * 1000;
+
+    discountCampaign = { boostSinceDays, endsAt };
+    saveCampaignFile(discountCampaign);
+
+    const endsDate = new Date(endsAt).toLocaleDateString("en-PK", {
+      timeZone: "Asia/Karachi", day: "numeric", month: "long", year: "numeric"
+    });
+
+    const buySellChannel = guild.channels.cache.get(BUYSELL_CHANNEL_ID);
+    if (buySellChannel) {
+      await buySellChannel.send(
+        `🎉 **Special DVA Discount Campaign!**\n\n` +
+        `Server boosters who have been boosting for **${boostSinceDays}+ days** get a **0.5% DVA fee** instead of the standard 1%!\n\n` +
+        `📅 Campaign ends: **${endsDate}**\n` +
+        `Use **/fee** to calculate your deal fee.`
+      );
+    }
+
+    return interaction.reply({
+      content: `✅ Discount campaign started!\n**Minimum boost:** ${boostSinceDays} days\n**Duration:** ${durationDays} days\n**Ends:** ${endsDate}`,
+      ephemeral: true
+    });
+  }
+
   // ── /dva confirm ────────────────────────────────────────────────────────────
   if (sub === "confirm") {
     if (!ctx.deal)                    return interaction.reply({ content: "❌ No active deal.", ephemeral: true });
@@ -553,41 +629,48 @@ client.on("interactionCreate", async interaction => {
     ctx.deal.amount   = amount;
     ctx.deal.amounts  = [amount];
 
-    if (amount >= BOOSTER_THRESHOLD) {
-      const bMember = guild.members.cache.get(ctx.deal.buyerId);
-      const sMember = guild.members.cache.get(ctx.deal.sellerId);
+    const bMember = guild.members.cache.get(ctx.deal.buyerId);
+    const sMember = guild.members.cache.get(ctx.deal.sellerId);
+
+    let boosterMember = null;
+    let discountTag   = null;
+
+    // Campaign check first — lower threshold, no amount minimum
+    if (isCampaignActive()) {
+      const bDays = getBoosterDays(bMember);
+      const sDays = getBoosterDays(sMember);
+      boosterMember = bDays >= discountCampaign.boostSinceDays ? bMember
+                    : sDays >= discountCampaign.boostSinceDays ? sMember : null;
+      if (boosterMember) discountTag = `🎉 Campaign discount applied for <@${boosterMember.id}> — Fee: **0.5%**`;
+    }
+
+    // Fall back to regular booster check (3+ months, 500+ USDT)
+    if (!boosterMember && amount >= BOOSTER_THRESHOLD) {
       const bMonths = getBoosterMonths(bMember);
       const sMonths = getBoosterMonths(sMember);
-      const booster = bMonths >= BOOSTER_MIN_MONTHS ? bMember
+      boosterMember = bMonths >= BOOSTER_MIN_MONTHS ? bMember
                     : sMonths >= BOOSTER_MIN_MONTHS ? sMember : null;
+      if (boosterMember) discountTag = `🎉 Booster discount applied for <@${boosterMember.id}> — Fee: **0.5%**`;
+    }
 
-      if (booster) {
-        ctx.deal.feePercent   = 0.5;
-        ctx.deal.booster      = booster.id;
-        ctx.deal.boosterName  = booster.user.username;
-        ctx.deal.escrowAmount = parseFloat((amount - amount * 0.005).toFixed(4));
-        await dvaChannel.send(
-          `✅ ${amount} USDT received\n` +
-          `🔒 ${ctx.deal.escrowAmount} USDT escrow\n\n` +
-          `🎉 Booster discount applied for <@${booster.id}> — Fee: **0.5%**\n\n` +
-          `<@${ctx.deal.buyerId}> Please send funds to <@${ctx.deal.sellerId}>`
-        );
-      } else {
-        ctx.deal.feePercent   = 1;
-        ctx.deal.escrowAmount = parseFloat((amount - amount * 0.01).toFixed(4));
-        await dvaChannel.send(
-          `✅ ${amount} USDT received\n` +
-          `🔒 ${ctx.deal.escrowAmount} USDT escrow\n\n` +
-          `📋 Fee: **1%**\n\n` +
-          `<@${ctx.deal.buyerId}> Please send funds to <@${ctx.deal.sellerId}>`
-        );
-      }
-    } else {
-      ctx.deal.feePercent   = 1;
-      ctx.deal.escrowAmount = parseFloat((amount - amount * 0.01).toFixed(4));
+    if (boosterMember) {
+      ctx.deal.feePercent   = 0.5;
+      ctx.deal.booster      = boosterMember.id;
+      ctx.deal.boosterName  = boosterMember.user.username;
+      ctx.deal.escrowAmount = parseFloat((amount - amount * 0.005).toFixed(4));
       await dvaChannel.send(
         `✅ ${amount} USDT received\n` +
         `🔒 ${ctx.deal.escrowAmount} USDT escrow\n\n` +
+        `${discountTag}\n\n` +
+        `<@${ctx.deal.buyerId}> Please send funds to <@${ctx.deal.sellerId}>`
+      );
+    } else {
+      ctx.deal.feePercent   = 1;
+      ctx.deal.escrowAmount = parseFloat((amount - amount * 0.01).toFixed(4));
+      const feeNote = amount >= BOOSTER_THRESHOLD ? "\n\n📋 Fee: **1%**" : "";
+      await dvaChannel.send(
+        `✅ ${amount} USDT received\n` +
+        `🔒 ${ctx.deal.escrowAmount} USDT escrow${feeNote}\n\n` +
         `<@${ctx.deal.buyerId}> Please send funds to <@${ctx.deal.sellerId}>`
       );
     }
