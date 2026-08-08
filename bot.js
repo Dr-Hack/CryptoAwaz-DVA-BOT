@@ -544,6 +544,15 @@ async function getLastMonthStats() {
   return { label: tabs[0], ...calcStats(rows.filter(r => r[0] && !isNaN(r[0]))) };
 }
 
+async function getAllTimeVolume() {
+  const sheets = getSheets();
+  const col    = await getRange(sheets, `${MONTHLY_TAB}!G:G`);
+  return col.reduce((s, r) => {
+    const v = parseFloat((r[0] || "").toString().replace(/[$,]/g, ""));
+    return s + (isNaN(v) ? 0 : v);
+  }, 0);
+}
+
 async function getLast7DaysStats() {
   const sheets  = getSheets();
   const rows    = await getRange(sheets, `${FUND_LOG_TAB}!A:J`);
@@ -581,18 +590,19 @@ client.on("interactionCreate", async interaction => {
       });
     }
     await interaction.deferReply();
-    const [last, week] = await Promise.all([getLastMonthStats(), getLast7DaysStats()]);
+    const [last, week, allTimeVol] = await Promise.all([getLastMonthStats(), getLast7DaysStats(), getAllTimeVolume()]);
     const lines = ["📊 **DVA Stats**\n"];
     if (last) lines.push(
       `📅 **Last Completed Month — ${last.label}**\n` +
       `• ${last.deals} deals · $${last.volume.toFixed(2)} USDT\n` +
-      `• ${last.members} members · ${last.boosterDeals} booster deals saved $${last.savings.toFixed(2)} USDT in fee`
+      `• ${last.members} members (${last.boosterDeals} boosters saved $${last.savings.toFixed(2)} USDT in fee)`
     );
     lines.push(
       `\n📈 **Last 7 Days (${week.label})**\n` +
       `• ${week.deals} deals · $${week.volume.toFixed(2)} USDT\n` +
-      `• ${week.members} members · ${week.boosterDeals} booster deals saved $${week.savings.toFixed(2)} USDT in fee`
+      `• ${week.members} members (${week.boosterDeals} boosters saved $${week.savings.toFixed(2)} USDT in fee)`
     );
+    lines.push(`\n🗓️ **Since January 2025**\n• $${allTimeVol.toFixed(2)} USDT total volume`);
     return interaction.editReply(lines.join("\n"));
   }
 
