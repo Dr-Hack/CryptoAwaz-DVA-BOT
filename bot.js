@@ -122,7 +122,9 @@ async function logDeal(deal, closerStaffId) {
   row[1] = now;
   row[5] = deal.amount;
   row[6] = fee;
-  row[7] = deal.booster ? `Yes (@${deal.boosterName})` : "No";
+  row[7] = deal.booster
+    ? `Yes (@${deal.boosterName})${deal.boosterCampaign ? " [Campaign]" : ""}`
+    : "No";
   row[8] = `${deal.buyerName} (${deal.buyerId})`;
   row[9] = `${deal.sellerName} (${deal.sellerId})`;
 
@@ -729,8 +731,9 @@ client.on("interactionCreate", async interaction => {
     const bMember = guild.members.cache.get(ctx.deal.buyerId);
     const sMember = guild.members.cache.get(ctx.deal.sellerId);
 
-    let boosterMember = null;
-    let discountTag   = null;
+    let boosterMember  = null;
+    let discountTag    = null;
+    let isCampaignDeal = false;
 
     // Campaign check first — lower boosting-days threshold, same 500 USDT minimum
     if (isCampaignActive() && amount >= BOOSTER_THRESHOLD) {
@@ -738,7 +741,10 @@ client.on("interactionCreate", async interaction => {
       const sDays = getBoosterDays(sMember);
       boosterMember = bDays >= discountCampaign.boostSinceDays ? bMember
                     : sDays >= discountCampaign.boostSinceDays ? sMember : null;
-      if (boosterMember) discountTag = `🎉 Campaign discount applied for <@${boosterMember.id}> — Fee: **0.5%**`;
+      if (boosterMember) {
+        discountTag    = `🎉 Campaign discount applied for <@${boosterMember.id}> — Fee: **0.5%**`;
+        isCampaignDeal = true;
+      }
     }
 
     // Fall back to regular booster check (3+ months, 500+ USDT)
@@ -751,8 +757,9 @@ client.on("interactionCreate", async interaction => {
     }
 
     if (boosterMember) {
-      ctx.deal.feePercent   = 0.5;
-      ctx.deal.booster      = boosterMember.id;
+      ctx.deal.feePercent      = 0.5;
+      ctx.deal.booster         = boosterMember.id;
+      ctx.deal.boosterCampaign = isCampaignDeal;
       ctx.deal.boosterName  = boosterMember.user.username;
       ctx.deal.escrowAmount = parseFloat((amount - amount * 0.005).toFixed(4));
       await dvaChannel.send(
