@@ -813,11 +813,19 @@ client.on("messageCreate", async message => {
   if (message.author.bot) return;
   if (message.channel.id !== BUYSELL_CHANNEL_ID) return;
   if (!message.mentions.roles.has(STAFF_ROLE_ID)) return;
-  if (!dealState.normal.deal && !dealState.cash.deal) return;
 
-  await message.reply(
-    `⏳ A DVA deal is currently in progress. Please wait and I will let you know once the ongoing deal is over.`
-  );
+  const normalBusy = !!dealState.normal.deal;
+  const cashBusy   = !!dealState.cash.deal;
+
+  if (!normalBusy && !cashBusy) return;
+
+  if (normalBusy && cashBusy) {
+    await message.reply(`⏳ DVA deals are currently in progress in both <#${DVA_CHANNEL_ID}> and <#${DVA_CASH_CHANNEL_ID}>. Please wait and I will let you know once a slot is available.`);
+  } else if (normalBusy) {
+    await message.reply(`⏳ A DVA deal is currently in progress in <#${DVA_CHANNEL_ID}>. Please wait and I will let you know once it's done.`);
+  } else {
+    await message.reply(`✅ <#${DVA_CHANNEL_ID}> is available! Only a cash deal is ongoing in <#${DVA_CASH_CHANNEL_ID}>. Please wait and Staff will get back to you.`);
+  }
 });
 
 // ─── GLOBAL ERROR HANDLERS (prevent crash on unhandled errors) ────────────────
