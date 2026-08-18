@@ -29,7 +29,7 @@ const STAFF = {
     name: "SilentKiller",
     colIndex: 3, // logs to Column D
     binanceId: "35798024",
-    message: "Please share deal details and proceed as per SOP.\nAll deal related talk to be done in this chat, including sharing of Bank information, which is deleted on termination of a deal.\n\n**Binance ID:** `35798024` | **Username:** `SilentKiller4233`\n**SOL BINANCE USDC/USDT:**\n`41poDbaaHWPd3GCHNXZz8XroNy9xzLeYYtqjFTCMya7X`\n**ETH/BEP20 BINANCE USDC/USDT:**\n`0xe50376a8566f348c17aa10e83182ac7e7f44ebe3`\n**TRC20 BINANCE USDT:**\n`TQ1VrZNo7zj8RvPg8RjXwyS2UcsWgv6ENV`"
+    message: "Please share deal details and proceed as per SOP.\nAll deal related talk to be done in this chat, including sharing of Bank information, which is deleted on termination of a deal.\n\n**Binance ID:** `35798024` | **Username:** SilentKiller4233\n**SOL BINANCE USDC/USDT:**\n`41poDbaaHWPd3GCHNXZz8XroNy9xzLeYYtqjFTCMya7X`\n**ETH/BEP20 BINANCE USDC/USDT:**\n`0xe50376a8566f348c17aa10e83182ac7e7f44ebe3`\n**TRC20 BINANCE USDT:**\n`TQ1VrZNo7zj8RvPg8RjXwyS2UcsWgv6ENV`"
   }
 };
 
