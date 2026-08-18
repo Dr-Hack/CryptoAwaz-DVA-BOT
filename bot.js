@@ -1,6 +1,6 @@
 // DVA Bot - bot.js
-// Version: 1.23
-// Last Modified: 2026-08-09
+// Version: 1.24
+// Last Modified: 2026-08-18
 // Dependencies: discord.js@14, googleapis, dotenv, node-cron
 // Install: npm install discord.js googleapis dotenv node-cron
 
@@ -17,19 +17,19 @@ const STAFF = {
     name: "Niazai",
     colIndex: 1, // logs to Column B in Fund Log
     binanceId: "11905680",
-    message: "Please share deal details and proceed as per SOP.\nAll deal related talk to be done in this chat, including sharing of Bank information, which is deleted on termination of a deal. Share screenshot after making any payment.\n\n**Binance ID:** 11905680"
+    message: "Please share deal details and proceed as per SOP.\nAll deal related talk to be done in this chat, including sharing of Bank information, which is deleted on termination of a deal. Share screenshot after making any payment.\n\n**Binance ID:** `11905680`"
   },
   "814816806895091752": {
     name: "Nomy",
     colIndex: 2, // logs to Column C
     binanceId: "75096450",
-    message: "Please share the deal details and proceed according to the DVA SOP. Both of you are advised to use personal accounts for sending and receiving PKR to avoid future banking issues. Share all transaction-related details, including bank screenshots and receipts, in this chat. Bank information will be deleted once the deal is completed.\n\n**Binance ID:** 75096450\n**TRC-20 USDT:** TVWmhTBdZb5ech2Rx3vfXEwdzT6D3gzuuA\n**BEP-20 USDT:** 0xf8387123c01a5e1a18c73cd550cba3763d6dc3f3"
+    message: "Please share the deal details and proceed according to the DVA SOP. Both of you are advised to use personal accounts for sending and receiving PKR to avoid future banking issues. Share all transaction-related details, including bank screenshots and receipts, in this chat. Bank information will be deleted once the deal is completed.\n\n**Binance ID:** `75096450`\n**TRC-20 USDT:** `TVWmhTBdZb5ech2Rx3vfXEwdzT6D3gzuuA`\n**BEP-20 USDT:** `0xf8387123c01a5e1a18c73cd550cba3763d6dc3f3`"
   },
   "349465216209387530": {
     name: "SilentKiller",
     colIndex: 3, // logs to Column D
     binanceId: "35798024",
-    message: "Please share deal details and proceed as per SOP.\nAll deal related talk to be done in this chat, including sharing of Bank information, which is deleted on termination of a deal.\n\n**Binance ID:** 35798024 | **Username:** SilentKiller4233\n**SOL BINANCE USDC/USDT:**\n41poDbaaHWPd3GCHNXZz8XroNy9xzLeYYtqjFTCMya7X\n**ETH/BEP20 BINANCE USDC/USDT:**\n0xe50376a8566f348c17aa10e83182ac7e7f44ebe3\n**TRC20 BINANCE USDT:**\nTQ1VrZNo7zj8RvPg8RjXwyS2UcsWgv6ENV"
+    message: "Please share deal details and proceed as per SOP.\nAll deal related talk to be done in this chat, including sharing of Bank information, which is deleted on termination of a deal.\n\n**Binance ID:** `35798024` | **Username:** `SilentKiller4233`\n**SOL BINANCE USDC/USDT:**\n`41poDbaaHWPd3GCHNXZz8XroNy9xzLeYYtqjFTCMya7X`\n**ETH/BEP20 BINANCE USDC/USDT:**\n`0xe50376a8566f348c17aa10e83182ac7e7f44ebe3`\n**TRC20 BINANCE USDT:**\n`TQ1VrZNo7zj8RvPg8RjXwyS2UcsWgv6ENV`"
   }
 };
 
