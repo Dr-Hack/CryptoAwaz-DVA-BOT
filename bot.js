@@ -1,5 +1,5 @@
 // DVA Bot - bot.js
-// Version: 1.27
+// Version: 1.28
 // Last Modified: 2026-08-23
 // Dependencies: discord.js@14, googleapis, dotenv, node-cron
 // Install: npm install discord.js googleapis dotenv node-cron
@@ -384,10 +384,6 @@ function loadCampaignFile() {
 
 function saveCampaignFile(campaign) {
   fs.writeFileSync(CAMPAIGN_FILE, JSON.stringify(campaign, null, 2));
-}
-
-function clearCampaignFile() {
-  try { if (fs.existsSync(CAMPAIGN_FILE)) fs.unlinkSync(CAMPAIGN_FILE); } catch (_) {}
 }
 
 let discountCampaign = loadCampaignFile();
