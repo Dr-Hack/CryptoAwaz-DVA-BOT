@@ -1,5 +1,5 @@
 // DVA Bot - bot.js
-// Version: 1.26
+// Version: 1.27
 // Last Modified: 2026-08-23
 // Dependencies: discord.js@14, googleapis, dotenv, node-cron
 // Install: npm install discord.js googleapis dotenv node-cron
@@ -922,6 +922,11 @@ client.on("interactionCreate", async interaction => {
     stopCloseReminder(key);
 
     await dvaChannel.send(`❌ DVA deal cancelled.\n📝 Reason: ${reason}`);
+
+    const buySellChannel = guild.channels.cache.get(BUYSELL_CHANNEL_ID);
+    if (buySellChannel) {
+      await buySellChannel.send(`🔔 Previous DVA has been cancelled. You may tag Staff again for DVA.`);
+    }
 
     try {
       const dvaRole = guild.roles.cache.get(tempRoleId);
