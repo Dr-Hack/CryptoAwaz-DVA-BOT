@@ -1,6 +1,6 @@
 // DVA Bot - bot.js
-// Version: 1.24
-// Last Modified: 2026-08-18
+// Version: 1.26
+// Last Modified: 2026-08-23
 // Dependencies: discord.js@14, googleapis, dotenv, node-cron
 // Install: npm install discord.js googleapis dotenv node-cron
 
@@ -102,7 +102,9 @@ async function getNextDealId(sheets) {
 // ─── AMOUNT DISPLAY HELPER ────────────────────────────────────────────────────
 function formatAmountDisplay(deal) {
   if (deal.amounts && deal.amounts.length > 1) {
-    return `${deal.amounts.join("+")} : ${deal.amount}`;
+    const expr = deal.amounts.reduce((s, v, i) =>
+      i === 0 ? `${v}` : v < 0 ? `${s}${v}` : `${s}+${v}`, "");
+    return `${expr} : ${deal.amount}`;
   }
   return `${deal.amount}`;
 }
@@ -455,8 +457,8 @@ const commands = [
     )
     .addSubcommand(s => s
       .setName("confirm-update")
-      .setDescription("Add more USDT to the current deal escrow")
-      .addNumberOption(o => o.setName("amount").setDescription("Additional USDT amount").setRequired(true))
+      .setDescription("Adjust the current deal escrow amount (positive to add, negative to reduce)")
+      .addNumberOption(o => o.setName("amount").setDescription("Amount to add (e.g. 100) or remove (e.g. -50)").setRequired(true))
     )
     .addSubcommand(s => s
       .setName("release")
@@ -804,9 +806,17 @@ client.on("interactionCreate", async interaction => {
     // Graceful backward compat: if amounts wasn't stored (old deal), seed it now
     if (!ctx.deal.amounts) ctx.deal.amounts = [ctx.deal.amount];
 
+    const newTotal = parseFloat((ctx.deal.amount + addAmount).toFixed(4));
+    if (newTotal <= 0) {
+      return interaction.reply({
+        content: `❌ Adjustment would bring the total to **${newTotal} USDT**. Cannot go to zero or negative.`,
+        ephemeral: true
+      });
+    }
+
     ctx.deal.amounts.push(addAmount);
-    ctx.deal.amount      = parseFloat((ctx.deal.amount + addAmount).toFixed(4));
-    const feePct         = ctx.deal.feePercent / 100;
+    ctx.deal.amount       = newTotal;
+    const feePct          = ctx.deal.feePercent / 100;
     ctx.deal.escrowAmount = parseFloat((ctx.deal.amount * (1 - feePct)).toFixed(4));
 
     const amountDisplay = formatAmountDisplay(ctx.deal);
@@ -817,7 +827,11 @@ client.on("interactionCreate", async interaction => {
     );
     saveDeal(ctx.deal, ctx.file);
 
-    return interaction.reply({ content: "✅ Escrow amount updated.", ephemeral: true });
+    let replyMsg = "✅ Escrow amount updated.";
+    if (ctx.deal.booster && ctx.deal.amount < BOOSTER_THRESHOLD) {
+      replyMsg += `\n\n⚠️ Heads up: total is now **${ctx.deal.amount} USDT**, which is below the **${BOOSTER_THRESHOLD} USDT** booster threshold. The 0.5% fee remains locked for this deal.`;
+    }
+    return interaction.reply({ content: replyMsg, ephemeral: true });
   }
 
   // ── /dva release ────────────────────────────────────────────────────────────
