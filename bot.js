@@ -1,5 +1,5 @@
 // DVA Bot - bot.js
-// Version: 1.29
+// Version: 1.30
 // Last Modified: 2026-08-28
 // Dependencies: discord.js@14, googleapis, dotenv, node-cron
 // Install: npm install discord.js googleapis dotenv node-cron
@@ -713,53 +713,74 @@ function parseCid(customId) {
 const pendingBank = new Map();
 const pKey = (key, userId) => `${key}:${userId}`;
 
-function detailButtonsRow(key, token, sellerSaved, buyerSaved) {
-  const row = new ActionRowBuilder();
-  row.addComponents(
-    new ButtonBuilder()
-      .setCustomId(cid(sellerSaved ? "sellerpick" : "sellernew", key, token))
-      .setLabel(sellerSaved ? "💳 Seller — Use Saved Account" : "💳 Seller — Bank Details")
-      .setStyle(sellerSaved ? ButtonStyle.Success : ButtonStyle.Primary),
-    new ButtonBuilder()
-      .setCustomId(cid(buyerSaved ? "buyerpick" : "buyernew", key, token))
-      .setLabel(buyerSaved ? "🏦 Buyer — Use Saved Binance" : "🏦 Buyer — Payout Details")
-      .setStyle(buyerSaved ? ButtonStyle.Success : ButtonStyle.Primary)
-  );
-  return row;
+// One row per party. When a saved account exists the party gets both paths side
+// by side — reuse it, or enter a different one — so adding a new account never
+// depends on finding a button hidden inside an ephemeral reply.
+function detailButtonRows(key, token, sellerSaved, buyerSaved) {
+  const sellerRow = new ActionRowBuilder();
+  if (sellerSaved) {
+    sellerRow.addComponents(new ButtonBuilder()
+      .setCustomId(cid("sellerpick", key, token))
+      .setLabel("💳 Seller — Use Saved Account")
+      .setStyle(ButtonStyle.Success));
+  }
+  sellerRow.addComponents(new ButtonBuilder()
+    .setCustomId(cid("sellernew", key, token))
+    .setLabel(sellerSaved ? "➕ Seller — Different Account" : "💳 Seller — Bank Details")
+    .setStyle(sellerSaved ? ButtonStyle.Secondary : ButtonStyle.Primary));
+
+  const buyerRow = new ActionRowBuilder();
+  if (buyerSaved) {
+    buyerRow.addComponents(new ButtonBuilder()
+      .setCustomId(cid("buyerpick", key, token))
+      .setLabel("🏦 Buyer — Use Saved Binance")
+      .setStyle(ButtonStyle.Success));
+  }
+  buyerRow.addComponents(new ButtonBuilder()
+    .setCustomId(cid("buyernew", key, token))
+    .setLabel(buyerSaved ? "➕ Buyer — Add Wallet / Update" : "🏦 Buyer — Payout Details")
+    .setStyle(buyerSaved ? ButtonStyle.Secondary : ButtonStyle.Primary));
+
+  return [sellerRow, buyerRow];
 }
 
-function sellerModal(key, token, needsBankText) {
+// `prefill` carries whatever the party already chose this deal, so correcting a
+// typo — or keeping a Binance ID while adding a wallet — means editing a filled
+// form rather than retyping it from scratch.
+const withValue = (input, v) => (v ? input.setValue(String(v).slice(0, 100)) : input);
+
+function sellerModal(key, token, needsBankText, prefill = {}) {
   const modal = new ModalBuilder().setCustomId(cid("sellermodal", key, token)).setTitle("Seller — Receiving Account");
   const fields = [];
   if (needsBankText) {
-    fields.push(new TextInputBuilder().setCustomId("bank").setLabel("Bank / Wallet Name")
-      .setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(60));
+    fields.push(withValue(new TextInputBuilder().setCustomId("bank").setLabel("Bank / Wallet Name")
+      .setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(60), prefill.bank));
   }
   fields.push(
-    new TextInputBuilder().setCustomId("title").setLabel("Account Title / Name")
-      .setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(80),
-    new TextInputBuilder().setCustomId("account").setLabel("Account Number")
-      .setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(40),
-    new TextInputBuilder().setCustomId("iban").setLabel("IBAN (optional)")
-      .setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(40)
+    withValue(new TextInputBuilder().setCustomId("title").setLabel("Account Title / Name")
+      .setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(80), prefill.title),
+    withValue(new TextInputBuilder().setCustomId("account").setLabel("Account Number")
+      .setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(40), prefill.account),
+    withValue(new TextInputBuilder().setCustomId("iban").setLabel("IBAN (optional)")
+      .setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(40), prefill.iban)
   );
   modal.addComponents(...fields.map(f => new ActionRowBuilder().addComponents(f)));
   return modal;
 }
 
-function buyerModal(key, token) {
+function buyerModal(key, token, prefill = {}) {
   return new ModalBuilder()
     .setCustomId(cid("buyermodal", key, token))
     .setTitle("Buyer — Where to receive USDT")
     .addComponents(
-      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("binanceId")
-        .setLabel("Binance ID").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(30)),
-      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("binanceName")
-        .setLabel("Binance Name").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(60)),
-      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("wallet")
-        .setLabel("Wallet Address (optional)").setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(120)),
-      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("network")
-        .setLabel("Network — TRC-20 / BEP-20 / SOL (optional)").setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(30))
+      new ActionRowBuilder().addComponents(withValue(new TextInputBuilder().setCustomId("binanceId")
+        .setLabel("Binance ID").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(30), prefill.binanceId)),
+      new ActionRowBuilder().addComponents(withValue(new TextInputBuilder().setCustomId("binanceName")
+        .setLabel("Binance Name").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(60), prefill.binanceName)),
+      new ActionRowBuilder().addComponents(withValue(new TextInputBuilder().setCustomId("wallet")
+        .setLabel("Wallet Address (optional)").setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(120), prefill.wallet)),
+      new ActionRowBuilder().addComponents(withValue(new TextInputBuilder().setCustomId("network")
+        .setLabel("Network — TRC-20 / BEP-20 / SOL (optional)").setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(30), prefill.network))
     );
 }
 
@@ -783,11 +804,12 @@ function sellerBankBlock(deal, sellerMember) {
   ];
   if (b.iban) lines.push(`   IBAN:     \`${b.iban}\``);
   lines.push(badgeLine(sellerMember, b.knownAccount));
+  // State the relation and leave the judgement to the buyer — no risk framing.
   if (!isSelfRelation(b.relation)) {
     lines.push(
       ``,
-      `⚠️ **Third-party account** — <@${deal.sellerId}> listed this account as ` +
-      `**${b.relation}**, not their own. Using someone else's account can cause banking issues.`
+      `ℹ️ <@${deal.sellerId}> has listed this account as **${b.relation}**. ` +
+      `<@${deal.buyerId}> — please proceed if you are comfortable.`
     );
   }
   return lines.join("\n");
@@ -1076,7 +1098,16 @@ async function handleDetailInteraction(interaction) {
 
     deal.sellerBank = { ...a, knownAccount: true };
     saveDeal(deal, ctx.file);
-    await interaction.editReply({ content: `✅ Using your **${a.bank}** account ending ${maskTail(a.account)}.`, components: [] });
+    // Keep a way out — picking a saved account must not be a dead end.
+    await interaction.editReply({
+      content: `✅ Using your **${a.bank}** account ending ${maskTail(a.account)}.\nWrong one? Use the buttons below.`,
+      components: [new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(cid("sellerpick", key, token))
+          .setLabel("💳 Pick Another Saved").setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId(cid("sellernew", key, token))
+          .setLabel("➕ Enter a Different Account").setStyle(ButtonStyle.Secondary)
+      )]
+    });
     return dvaChannelFor(guild, key).send(`✅ <@${deal.sellerId}> has submitted their bank details.`);
   }
 
@@ -1094,9 +1125,11 @@ async function handleDetailInteraction(interaction) {
       content: "Step 1 of 2 — pick your bank and your relation to the account, then press Continue.",
       components: [
         new ActionRowBuilder().addComponents(new StringSelectMenuBuilder()
-          .setCustomId(cid("bankpick", key, token)).setPlaceholder("Bank / Wallet").addOptions(bankSelectOptions())),
+          .setCustomId(cid("bankpick", key, token)).setPlaceholder("Bank / Wallet")
+          .addOptions(bankSelectOptions())),
         new ActionRowBuilder().addComponents(new StringSelectMenuBuilder()
-          .setCustomId(cid("relpick", key, token)).setPlaceholder("Relation with account").addOptions(relationSelectOptions())),
+          .setCustomId(cid("relpick", key, token)).setPlaceholder("Relation with account")
+          .addOptions(relationSelectOptions())),
         new ActionRowBuilder().addComponents(new ButtonBuilder()
           .setCustomId(cid("sellercont", key, token)).setLabel("Continue →").setStyle(ButtonStyle.Primary))
       ]
@@ -1116,7 +1149,10 @@ async function handleDetailInteraction(interaction) {
     if (!p?.bank || !p?.relation) {
       return interaction.reply({ content: "❌ Please choose both a bank and a relation first.", ephemeral: true });
     }
-    return interaction.showModal(sellerModal(key, token, p.bank === OTHER_BANK));
+    // Only carry the title forward — the account number must be typed fresh so a
+    // different account never inherits the previous one's digits.
+    return interaction.showModal(sellerModal(key, token, p.bank === OTHER_BANK,
+      { title: deal.sellerBank?.title }));
   }
 
   if (action === "sellermodal") {
@@ -1184,12 +1220,21 @@ async function handleDetailInteraction(interaction) {
 
     deal.buyerPayout = { ...a, wallet: "", network: "", knownAccount: true };
     saveDeal(deal, ctx.file);
-    await interaction.editReply({ content: `✅ Using Binance ID \`${a.binanceId}\`.`, components: [] });
+    // A saved Binance ID carries no wallet, so offer the route to add one.
+    await interaction.editReply({
+      content: `✅ Using Binance ID \`${a.binanceId}\`.\nWant USDT sent to a wallet instead, or on a specific network? Add it below.`,
+      components: [new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(cid("buyernew", key, token))
+          .setLabel("➕ Add Wallet / Change Details").setStyle(ButtonStyle.Secondary)
+      )]
+    });
     return dvaChannelFor(guild, key).send(`✅ <@${deal.buyerId}> has submitted their payout details.`);
   }
 
   if (action === "buyernew") {
-    return interaction.showModal(buyerModal(key, token));
+    // Pre-fill with whatever they already picked, so adding a wallet address
+    // does not mean retyping the Binance ID.
+    return interaction.showModal(buyerModal(key, token, deal.buyerPayout || {}));
   }
 
   if (action === "buyermodal") {
@@ -1357,9 +1402,12 @@ client.on("interactionCreate", async interaction => {
       content:
         `📋 **Both parties — please submit your details below.**\n` +
         `<@${seller.id}> — the account where you will receive PKR.\n` +
-        `<@${buyer.id}> — the Binance account where you will receive USDT.\n` +
+        `<@${buyer.id}> — the Binance account or wallet where you will receive USDT.\n` +
+        ((sellerSaved || buyerSaved)
+          ? `\n*Green = reuse an account you've used before. Grey = enter a different one.*`
+          : ``) +
         (detailRows === null ? `\n⚠️ Details Log is unreachable right now — entries may not be saved.` : ``),
-      components: [detailButtonsRow(key, ctx.deal.dealToken, sellerSaved, buyerSaved)]
+      components: detailButtonRows(key, ctx.deal.dealToken, sellerSaved, buyerSaved)
     });
 
     const buySellChannel = guild.channels.cache.get(BUYSELL_CHANNEL_ID);
@@ -1499,7 +1547,7 @@ client.on("interactionCreate", async interaction => {
     if (!ctx.deal.sellerBank) {
       confirmReply += `\n⚠️ Seller hasn't submitted bank details — collect manually or ask them to tap the button.`;
     } else if (!isSelfRelation(ctx.deal.sellerBank.relation)) {
-      confirmReply += `\n⚠️ Seller's account is third-party (**${ctx.deal.sellerBank.relation}**) — warning posted in channel.`;
+      confirmReply += `\nℹ️ Seller's account relation: **${ctx.deal.sellerBank.relation}** — noted in the channel.`;
     }
     return interaction.reply({ content: confirmReply, ephemeral: true });
   }
