@@ -1,5 +1,5 @@
 // DVA Bot - bot.js
-// Version: 1.30
+// Version: 1.31
 // Last Modified: 2026-08-28
 // Dependencies: discord.js@14, googleapis, dotenv, node-cron
 // Install: npm install discord.js googleapis dotenv node-cron
@@ -749,6 +749,17 @@ function detailButtonRows(key, token, sellerSaved, buyerSaved) {
 // form rather than retyping it from scratch.
 const withValue = (input, v) => (v ? input.setValue(String(v).slice(0, 100)) : input);
 
+// The account title is only carried forward when this account and the previous
+// one both belong to the seller. Under any other relation the name on the
+// account is someone else's by definition, and a stale pre-fill that goes
+// unnoticed would put the wrong name against a live bank transfer.
+function carryForwardTitle(prevBank, newRelation) {
+  if (!prevBank || !prevBank.title)          return undefined;
+  if (!isSelfRelation(newRelation))          return undefined;
+  if (!isSelfRelation(prevBank.relation))    return undefined;
+  return prevBank.title;
+}
+
 function sellerModal(key, token, needsBankText, prefill = {}) {
   const modal = new ModalBuilder().setCustomId(cid("sellermodal", key, token)).setTitle("Seller — Receiving Account");
   const fields = [];
@@ -1149,10 +1160,10 @@ async function handleDetailInteraction(interaction) {
     if (!p?.bank || !p?.relation) {
       return interaction.reply({ content: "❌ Please choose both a bank and a relation first.", ephemeral: true });
     }
-    // Only carry the title forward — the account number must be typed fresh so a
-    // different account never inherits the previous one's digits.
+    // The account number is always typed fresh, so a different account can never
+    // inherit the previous one's digits.
     return interaction.showModal(sellerModal(key, token, p.bank === OTHER_BANK,
-      { title: deal.sellerBank?.title }));
+      { title: carryForwardTitle(deal.sellerBank, p.relation) }));
   }
 
   if (action === "sellermodal") {
