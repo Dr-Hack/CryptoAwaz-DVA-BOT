@@ -12,6 +12,8 @@
 ## ✨ Features
 
 - **Full escrow workflow** — start, confirm, release, close, or cancel deals via slash commands
+- **Party detail collection** — buyer and seller submit Binance and bank details through private modals; the bot posts each to the other party at the right moment and deletes them on close
+- **Account registry** — every account used is logged to the `Details Log` tab for scam cross-referencing; returning traders pick a saved account instead of retyping
 - **Auto fee calculation** — 1% standard fee, 0.5% for Discord boosters (3+ months)
 - **Google Sheets logging** — every deal is logged with ID, date, staff share, parties, and booster info
 - **Monthly auto-archive** — on the 1st of each month, the Fund Log is archived to a named tab and summary totals are updated
@@ -32,9 +34,44 @@
 | `/dva release` | Releases escrow, logs the deal to Google Sheets |
 | `/dva close` | Closes the deal and removes DVA-Temp roles from both parties |
 | `/dva cancel [reason]` | Cancels the deal, removes roles, posts reason in channel |
+| `/dva details` | Ephemeral view of the bank/Binance details both parties submitted, with a button to post the buyer's payout block to the channel |
 
 > Only the staff member who started a deal can confirm, release, close, or cancel it.  
 > Only one deal can be active at a time across the server.
+
+---
+
+### 🔐 Party detail collection
+
+On `/dva start` the bot posts two buttons in the deal channel, each locked to one party:
+
+| Button | Opens | Collects |
+|---|---|---|
+| 💳 **Seller — Bank Details** | Bank ▾ + Relation ▾ pickers, then a modal | Account title, account number, IBAN |
+| 🏦 **Buyer — Payout Details** | Modal | Binance ID, Binance name, wallet, network |
+
+The **Bank** and **Relation** dropdown values are read live from the `Details Log` sheet's own
+data-validation rules — edit them in Sheets and the bot follows on next restart. Discord caps a
+dropdown at 25 options, so anything past the 24th bank folds into an `Other…` free-text entry.
+
+Details are then surfaced automatically:
+
+| Moment | What the bot posts |
+|---|---|
+| `/dva confirm` | Seller's receiving account, with a ⚠️ warning if the relation isn't `Self` |
+| Buyer uploads a receipt image | Prompts the seller to confirm payment, then shows the buyer's Binance details |
+| `/dva close` / `/dva cancel` | Deletes every message it posted containing account details |
+
+Each block carries a two-part badge: **verified status** comes from the Discord `VERIFIED` role
+(per person), **known/new account** comes from the sheet (per account) — so a verified member using
+an unfamiliar account is visible at a glance.
+
+Nothing is ever blocked. If a party hasn't submitted, the bot says so publicly and warns staff
+ephemerally, and the deal proceeds so details can be collected by hand.
+
+> ⚠️ The receipt-image trigger requires **Message Content Intent** to be enabled under
+> Bot → Privileged Gateway Intents in the Discord Developer Portal. Everything else works without it;
+> staff can always post the payout block via `/dva details`.
 
 ---
 
@@ -88,6 +125,32 @@ The DVA fee is always deducted from USDT. PKR is adjusted accordingly depending 
 | I | Buyer (username + ID) |
 | J | Seller (username + ID) |
 | K–L | Live summary block (staff totals) |
+
+### Details Log tab
+
+A per-person account registry — one row per account. A person may hold several rows.
+
+| Column | Field | Written by |
+|---|---|---|
+| A | Discord Name | Bot (on new rows) |
+| B | Verified ☑ | Bot — mirrors the Discord `VERIFIED` role, ticked **and** unticked |
+| C | Discord UID | Bot |
+| D | Title | Bot |
+| E | Bank ▾ | Bot (value comes from this column's own dropdown) |
+| F | Relation /w Ac ▾ | Bot (same) |
+| G | Acc Number | Bot |
+| H | IBAN | Bot |
+| I | Binance ID | Bot — multiple IDs stored as `1234 / 5678` |
+| J | Binance Name | Bot — kept positionally paired with column I |
+| K | Phone No. | **Never touched** |
+| L | Comments | **Never touched** |
+
+Write rules:
+- A **new bank account** appends a new row, so the history of every account a person has used is retained.
+- A **new Binance ID** fills the empty Binance cells across all of that person's rows, or is appended
+  as `old / new` where one is already present. A person with no rows at all gets a fresh one.
+- Rows are written at **submit time**, so a cancelled deal still leaves the account on record.
+- No bank or Binance data ever reaches the **Fund Log** tab.
 
 ### Monthly Collection tab
 

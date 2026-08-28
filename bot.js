@@ -1,12 +1,16 @@
 // DVA Bot - bot.js
-// Version: 1.28
-// Last Modified: 2026-08-23
+// Version: 1.29
+// Last Modified: 2026-08-28
 // Dependencies: discord.js@14, googleapis, dotenv, node-cron
 // Install: npm install discord.js googleapis dotenv node-cron
 
 require("dotenv").config();
 const feeCommand = require("./fee-command.js");
-const { Client, GatewayIntentBits, Partials, REST, Routes, SlashCommandBuilder } = require("discord.js");
+const {
+  Client, GatewayIntentBits, Partials, REST, Routes, SlashCommandBuilder,
+  ActionRowBuilder, ButtonBuilder, ButtonStyle,
+  StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle
+} = require("discord.js");
 const { google } = require("googleapis");
 const cron = require("node-cron");
 
@@ -45,7 +49,31 @@ const MONTHLY_TAB         = "Monthly Collection";
 const BOOSTER_MIN_MONTHS  = 3;
 const BOOSTER_THRESHOLD   = 500;
 const STAFF_ROLE_ID       = "831157132346130492";
+const VERIFIED_ROLE_ID    = "1399001208882200629";
 const MONTH_NAMES         = ["January","February","March","April","May","June","July","August","September","October","November","December"];
+
+// ─── DETAILS LOG CONFIG ───────────────────────────────────────────────────────
+// Per-person account registry. One row = one account record; a person may hold
+// several rows. Columns (0-indexed):
+//   0 A Discord Name | 1 B Verified ☑ | 2 C Discord UID | 3 D Title | 4 E Bank ▾
+//   5 F Relation ▾   | 6 G Acc Number | 7 H IBAN        | 8 I Binance ID
+//   9 J Binance Name | 10 K Phone No. | 11 L Comments
+// The bot never writes columns K or L. Column B is driven by the VERIFIED role.
+const DETAILS_TAB   = "Details Log";
+const DCOL = { NAME: 0, VERIFIED: 1, UID: 2, TITLE: 3, BANK: 4, RELATION: 5, ACCOUNT: 6, IBAN: 7, BINANCE_ID: 8, BINANCE_NAME: 9 };
+
+// Discord caps select menus at 25 options, so 24 banks + "Other…" is the ceiling.
+// Anything past 24 in the sheet folds into "Other…" (free-text entry).
+const BANK_OPTION_CAP = 24;
+const OTHER_BANK      = "Other…";
+
+// Relations that mean the seller owns the account — everything else warns.
+const SELF_RELATIONS = ["self", "self-business"];
+
+// Multiple Binance IDs are stored in one cell as "1234 / 5678".
+const MULTI_SEP = " / ";
+
+const SHEET_TIMEOUT_MS = 10000;
 
 // ─── GOOGLE SHEETS AUTH ───────────────────────────────────────────────────────
 function getSheets() {
@@ -97,6 +125,259 @@ async function getNextDealId(sheets) {
   const rows = await getRange(sheets, `${FUND_LOG_TAB}!A:A`);
   const ids  = rows.filter(r => r[0] && !isNaN(r[0])).map(r => parseInt(r[0]));
   return ids.length > 0 ? Math.max(...ids) + 1 : 1;
+}
+
+// ─── SHEET RESILIENCE ─────────────────────────────────────────────────────────
+// Details Log calls sit in the middle of a live deal, so a hung API call must
+// never stall it. Each call gets 10s, then one retry, then gives up and lets the
+// caller fall back. Returns null on failure rather than throwing.
+async function trySheet(label, fn) {
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    let timer;
+    try {
+      return await Promise.race([
+        fn(),
+        new Promise((_, rej) => { timer = setTimeout(() => rej(new Error("timed out")), SHEET_TIMEOUT_MS); })
+      ]);
+    } catch (e) {
+      console.error(`[DVA] ${label} attempt ${attempt}/2 failed:`, e.message);
+      if (attempt === 2) return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  return null;
+}
+
+// ─── DETAILS LOG — DROPDOWNS ──────────────────────────────────────────────────
+// Bank and Relation lists are read from the sheet's own data-validation rules so
+// the two can never drift. Edit the dropdown in Sheets, restart the bot, done.
+let dropdownCache = { banks: null, relations: null, fetchedAt: 0 };
+const DROPDOWN_TTL_MS = 60 * 60 * 1000;
+
+function readValidationList(cell) {
+  const cond = cell?.dataValidation?.condition;
+  if (!cond || cond.type !== "ONE_OF_LIST") return null;
+  const seen = new Set();
+  const out  = [];
+  for (const v of cond.values || []) {
+    const val = (v.userEnteredValue || "").trim();
+    if (!val) continue;
+    const dedupeKey = val.toLowerCase();          // "Allied" / "Allied bank" collapse
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+    out.push(val);
+  }
+  return out.length ? out : null;
+}
+
+async function refreshDropdowns(force = false) {
+  if (!force && dropdownCache.banks && Date.now() - dropdownCache.fetchedAt < DROPDOWN_TTL_MS) return dropdownCache;
+
+  const res = await trySheet("Dropdown fetch", async () => {
+    const sheets = getSheets();
+    return sheets.spreadsheets.get({
+      spreadsheetId: SHEET_ID,
+      ranges: [`${DETAILS_TAB}!E2:F2`],
+      includeGridData: true,
+      fields: "sheets.data.rowData.values.dataValidation"
+    });
+  });
+
+  const cells = res?.data?.sheets?.[0]?.data?.[0]?.rowData?.[0]?.values;
+  if (cells) {
+    dropdownCache = {
+      banks:     readValidationList(cells[0]) || dropdownCache.banks,
+      relations: readValidationList(cells[1]) || dropdownCache.relations,
+      fetchedAt: Date.now()
+    };
+    console.log(`[DVA] Dropdowns loaded — ${dropdownCache.banks?.length || 0} banks, ${dropdownCache.relations?.length || 0} relations.`);
+  } else {
+    console.error("[DVA] Could not read dropdowns from Details Log — falling back to free-text bank entry.");
+  }
+  return dropdownCache;
+}
+
+// Banks past the cap fold into "Other…", which opens a free-text field instead.
+function bankSelectOptions() {
+  const banks = (dropdownCache.banks || []).slice(0, BANK_OPTION_CAP);
+  return [...banks.map(b => ({ label: b.slice(0, 100), value: b.slice(0, 100) })),
+          { label: OTHER_BANK, value: OTHER_BANK, description: "Not listed — type the name yourself" }];
+}
+
+function relationSelectOptions() {
+  const rels = (dropdownCache.relations || ["Self"]).slice(0, 25);
+  return rels.map(r => ({ label: r.slice(0, 100), value: r.slice(0, 100) }));
+}
+
+function isSelfRelation(relation) {
+  return SELF_RELATIONS.includes((relation || "").trim().toLowerCase());
+}
+
+// ─── DETAILS LOG — READ ───────────────────────────────────────────────────────
+async function getDetailsRows() {
+  const rows = await trySheet("Details Log read", async () =>
+    getRange(getSheets(), `${DETAILS_TAB}!A2:L`));   // A1:L1 is the header row
+  return rows;   // null signals the sheet was unreachable
+}
+
+// "1234 / 5678" → ["1234", "5678"]; ID and Name columns stay positionally paired.
+function splitMulti(cell) {
+  return String(cell || "").split("/").map(s => s.trim()).filter(Boolean);
+}
+
+// A seller row is one carrying an account number; a buyer row carries a Binance ID.
+// Filtering on the column (not just UID) stops half-empty rows being offered back.
+function findSellerAccounts(rows, uid) {
+  return (rows || [])
+    .map((r, i) => ({ r, rowNum: i + 2 }))
+    .filter(({ r }) => r[DCOL.UID] === uid && String(r[DCOL.ACCOUNT] || "").trim())
+    .map(({ r, rowNum }) => ({
+      rowNum,
+      title:    r[DCOL.TITLE]    || "",
+      bank:     r[DCOL.BANK]     || "",
+      relation: r[DCOL.RELATION] || "",
+      account:  String(r[DCOL.ACCOUNT] || "").trim(),
+      iban:     r[DCOL.IBAN]     || ""
+    }));
+}
+
+function findBuyerAccounts(rows, uid) {
+  const out  = [];
+  const seen = new Set();
+  for (const r of rows || []) {
+    if (r[DCOL.UID] !== uid) continue;
+    const ids    = splitMulti(r[DCOL.BINANCE_ID]);
+    const names  = splitMulti(r[DCOL.BINANCE_NAME]);
+    ids.forEach((id, i) => {
+      if (seen.has(id)) return;
+      seen.add(id);
+      out.push({ binanceId: id, binanceName: names[i] || "" });
+    });
+  }
+  return out;
+}
+
+function maskTail(value) {
+  const s = String(value || "");
+  return s.length > 4 ? `••••${s.slice(-4)}` : s;
+}
+
+// ─── DETAILS LOG — WRITE ──────────────────────────────────────────────────────
+async function appendDetailsRow(row) {
+  return trySheet("Details Log append", async () => {
+    const sheets = getSheets();
+    return sheets.spreadsheets.values.append({
+      spreadsheetId: SHEET_ID,
+      range: `${DETAILS_TAB}!A:L`,
+      valueInputOption: "USER_ENTERED",
+      requestBody: { values: [row] }
+    });
+  });
+}
+
+// A new bank account is always a new row — history of every account is retained.
+async function recordSellerBank(member, bank) {
+  const rows = await getDetailsRows();
+  if (rows === null) return { ok: false };
+
+  const existing = findSellerAccounts(rows, member.id)
+    .find(a => a.account.replace(/\s/g, "") === bank.account.replace(/\s/g, ""));
+  if (existing) return { ok: true, added: false, known: true };
+
+  const row = Array(12).fill("");
+  row[DCOL.NAME]     = member.user.username;
+  row[DCOL.UID]      = member.id;
+  row[DCOL.TITLE]    = bank.title;
+  row[DCOL.BANK]     = bank.bank;
+  row[DCOL.RELATION] = bank.relation;
+  row[DCOL.ACCOUNT]  = bank.account;
+  row[DCOL.IBAN]     = bank.iban;
+  const res = await appendDetailsRow(row);
+  return { ok: res !== null, added: res !== null, known: false };
+}
+
+// A new Binance ID fills every empty Binance cell this person has, and is appended
+// as "old / new" where one is already present. Only if they have no rows at all
+// does a fresh row get created.
+async function recordBuyerPayout(member, payout) {
+  const rows = await getDetailsRows();
+  if (rows === null) return { ok: false };
+
+  const mine = (rows || [])
+    .map((r, i) => ({ r, rowNum: i + 2 }))
+    .filter(({ r }) => r[DCOL.UID] === member.id);
+
+  if (mine.length === 0) {
+    const row = Array(12).fill("");
+    row[DCOL.NAME]         = member.user.username;
+    row[DCOL.UID]          = member.id;
+    row[DCOL.BINANCE_ID]   = payout.binanceId;
+    row[DCOL.BINANCE_NAME] = payout.binanceName || "";
+    const res = await appendDetailsRow(row);
+    return { ok: res !== null, added: res !== null, known: false };
+  }
+
+  const updates = [];
+  let alreadyKnown = false;
+
+  for (const { r, rowNum } of mine) {
+    const ids = splitMulti(r[DCOL.BINANCE_ID]);
+    if (ids.includes(payout.binanceId)) { alreadyKnown = true; continue; }
+
+    const names   = splitMulti(r[DCOL.BINANCE_NAME]);
+    // Pad names so the Nth id always lines up with the Nth name.
+    while (names.length < ids.length) names.push("—");
+
+    const newId   = ids.length   ? `${r[DCOL.BINANCE_ID]}${MULTI_SEP}${payout.binanceId}` : payout.binanceId;
+    const newName = ids.length   ? `${names.join(MULTI_SEP)}${MULTI_SEP}${payout.binanceName || "—"}`
+                                 : (payout.binanceName || "");
+
+    updates.push({ range: `${DETAILS_TAB}!I${rowNum}:J${rowNum}`, values: [[newId, newName]] });
+  }
+
+  if (updates.length === 0) return { ok: true, added: false, known: alreadyKnown };
+
+  const res = await trySheet("Details Log binance update", async () => {
+    const sheets = getSheets();
+    return sheets.spreadsheets.values.batchUpdate({
+      spreadsheetId: SHEET_ID,
+      requestBody: { valueInputOption: "USER_ENTERED", data: updates }
+    });
+  });
+  return { ok: res !== null, added: res !== null, known: alreadyKnown };
+}
+
+// ─── VERIFIED ROLE SYNC ───────────────────────────────────────────────────────
+// The Discord role is the single source of truth in both directions — a member
+// who loses the role gets unticked, so the sheet can never show a stale ✅.
+function hasVerifiedRole(member) {
+  return !!member?.roles?.cache?.has(VERIFIED_ROLE_ID);
+}
+
+async function syncVerified(member) {
+  if (!member) return null;
+  const rows = await getDetailsRows();
+  if (rows === null) return null;
+
+  const want    = hasVerifiedRole(member);
+  const updates = [];
+  rows.forEach((r, i) => {
+    if (r[DCOL.UID] !== member.id) return;
+    const current = r[DCOL.VERIFIED] === true || String(r[DCOL.VERIFIED]).toUpperCase() === "TRUE";
+    if (current !== want) updates.push({ range: `${DETAILS_TAB}!B${i + 2}`, values: [[want]] });
+  });
+
+  if (updates.length === 0) return null;
+
+  const res = await trySheet("Verified sync", async () => {
+    const sheets = getSheets();
+    return sheets.spreadsheets.values.batchUpdate({
+      spreadsheetId: SHEET_ID,
+      requestBody: { valueInputOption: "USER_ENTERED", data: updates }
+    });
+  });
+  return res === null ? null : { ticked: want, rows: updates.length };
 }
 
 // ─── AMOUNT DISPLAY HELPER ────────────────────────────────────────────────────
@@ -416,6 +697,137 @@ function stopCloseReminder(key) {
   }
 }
 
+// ─── PARTY DETAIL COLLECTION — UI ─────────────────────────────────────────────
+// customId format: dva:<action>:<slot key>:<deal token>
+// The token is minted per deal, so buttons left behind by a closed deal are inert
+// rather than writing into whatever deal happens to be running now.
+function cid(action, key, token) { return `dva:${action}:${key}:${token}`; }
+
+function parseCid(customId) {
+  const [ns, action, key, token] = customId.split(":");
+  return ns === "dva" ? { action, key, token } : null;
+}
+
+// Bank + Relation are picked before the modal opens, so their selections have to
+// live somewhere between interactions. Keyed by slot + user, cleared on submit.
+const pendingBank = new Map();
+const pKey = (key, userId) => `${key}:${userId}`;
+
+function detailButtonsRow(key, token, sellerSaved, buyerSaved) {
+  const row = new ActionRowBuilder();
+  row.addComponents(
+    new ButtonBuilder()
+      .setCustomId(cid(sellerSaved ? "sellerpick" : "sellernew", key, token))
+      .setLabel(sellerSaved ? "💳 Seller — Use Saved Account" : "💳 Seller — Bank Details")
+      .setStyle(sellerSaved ? ButtonStyle.Success : ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId(cid(buyerSaved ? "buyerpick" : "buyernew", key, token))
+      .setLabel(buyerSaved ? "🏦 Buyer — Use Saved Binance" : "🏦 Buyer — Payout Details")
+      .setStyle(buyerSaved ? ButtonStyle.Success : ButtonStyle.Primary)
+  );
+  return row;
+}
+
+function sellerModal(key, token, needsBankText) {
+  const modal = new ModalBuilder().setCustomId(cid("sellermodal", key, token)).setTitle("Seller — Receiving Account");
+  const fields = [];
+  if (needsBankText) {
+    fields.push(new TextInputBuilder().setCustomId("bank").setLabel("Bank / Wallet Name")
+      .setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(60));
+  }
+  fields.push(
+    new TextInputBuilder().setCustomId("title").setLabel("Account Title / Name")
+      .setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(80),
+    new TextInputBuilder().setCustomId("account").setLabel("Account Number")
+      .setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(40),
+    new TextInputBuilder().setCustomId("iban").setLabel("IBAN (optional)")
+      .setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(40)
+  );
+  modal.addComponents(...fields.map(f => new ActionRowBuilder().addComponents(f)));
+  return modal;
+}
+
+function buyerModal(key, token) {
+  return new ModalBuilder()
+    .setCustomId(cid("buyermodal", key, token))
+    .setTitle("Buyer — Where to receive USDT")
+    .addComponents(
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("binanceId")
+        .setLabel("Binance ID").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(30)),
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("binanceName")
+        .setLabel("Binance Name").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(60)),
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("wallet")
+        .setLabel("Wallet Address (optional)").setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(120)),
+      new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("network")
+        .setLabel("Network — TRC-20 / BEP-20 / SOL (optional)").setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(30))
+    );
+}
+
+// ─── PARTY DETAIL COLLECTION — MESSAGE BLOCKS ─────────────────────────────────
+// Verified reads the live Discord role (per person); Known/New reads the sheet
+// (per account). A verified member on an unfamiliar account is the case worth
+// seeing, so the two are always shown side by side.
+function badgeLine(member, knownAccount) {
+  const verified = hasVerifiedRole(member) ? "✅ Verified member" : "⬜ Not verified";
+  const account  = knownAccount ? "Known account" : "🆕 New account — not used before";
+  return `   ${verified} · ${account}`;
+}
+
+function sellerBankBlock(deal, sellerMember) {
+  const b = deal.sellerBank;
+  const lines = [
+    `🏦 **Seller's Receiving Account**`,
+    `   Title:    \`${b.title}\``,
+    `   Bank:     \`${b.bank}\``,
+    `   Account:  \`${b.account}\``
+  ];
+  if (b.iban) lines.push(`   IBAN:     \`${b.iban}\``);
+  lines.push(badgeLine(sellerMember, b.knownAccount));
+  if (!isSelfRelation(b.relation)) {
+    lines.push(
+      ``,
+      `⚠️ **Third-party account** — <@${deal.sellerId}> listed this account as ` +
+      `**${b.relation}**, not their own. Using someone else's account can cause banking issues.`
+    );
+  }
+  return lines.join("\n");
+}
+
+function buyerPayoutBlock(deal, buyerMember) {
+  const p = deal.buyerPayout;
+  const lines = [
+    `🏦 **Once confirmed, release USDT to <@${deal.buyerId}>:**`,
+    `   Binance ID:   \`${p.binanceId}\``,
+    `   Binance Name: \`${p.binanceName}\``
+  ];
+  if (p.wallet)  lines.push(`   Wallet:       \`${p.wallet}\``);
+  if (p.network) lines.push(`   Network:      \`${p.network}\``);
+  lines.push(badgeLine(buyerMember, p.knownAccount));
+  return lines.join("\n");
+}
+
+// Missing details never block a deal — the bot says what's missing and the deal
+// carries on, so staff can always fall back to collecting them by hand.
+function sellerBlockOrWarning(deal, sellerMember) {
+  if (deal.sellerBank) return sellerBankBlock(deal, sellerMember);
+  return `⚠️ <@${deal.sellerId}> has not submitted bank details yet.\n` +
+         `   Tap **💳 Seller — Bank Details** above, or share them in chat and staff will proceed manually.`;
+}
+
+// Every message carrying account data is tracked so /dva close can delete it —
+// making good on the SOP promise that bank details are removed once a deal ends.
+function trackDetailMsg(deal, msg) {
+  if (!msg) return;
+  if (!deal.detailMsgIds) deal.detailMsgIds = [];
+  deal.detailMsgIds.push(msg.id);
+}
+
+async function purgeDetailMsgs(channel, deal) {
+  for (const id of deal.detailMsgIds || []) {
+    await channel.messages.delete(id).catch(() => {});   // already gone is fine
+  }
+}
+
 // ─── DISCORD CLIENT ───────────────────────────────────────────────────────────
 const client = new Client({
   intents: [
@@ -468,6 +880,10 @@ const commands = [
       .setName("cancel")
       .setDescription("Cancel the current deal")
       .addStringOption(o => o.setName("reason").setDescription("Reason (optional)"))
+    )
+    .addSubcommand(s => s
+      .setName("details")
+      .setDescription("View the bank/Binance details both parties submitted (staff only)")
     )
     .addSubcommand(s => s
       .setName("stats")
@@ -566,9 +982,251 @@ async function getLast7DaysStats() {
 }
 
 // ─── INTERACTION HANDLER ──────────────────────────────────────────────────────
+function dvaChannelFor(guild, key) {
+  return guild.channels.cache.get(key === "cash" ? DVA_CASH_CHANNEL_ID : DVA_CHANNEL_ID);
+}
+
+// Posts the buyer's payout block. Shared by the receipt-image trigger and the
+// [📤 Post Payout] button on /dva details.
+async function postBuyerPayout(guild, key, deal, prefix) {
+  const channel     = dvaChannelFor(guild, key);
+  const buyerMember = await guild.members.fetch(deal.buyerId).catch(() => null);
+  const msg = await channel.send(
+    `${prefix}\n\n<@${deal.sellerId}> — please confirm you have received the payment.\n\n` +
+    buyerPayoutBlock(deal, buyerMember)
+  );
+  trackDetailMsg(deal, msg);
+  deal.payoutPosted = true;
+  saveDeal(deal, dealState[key].file);
+  return msg;
+}
+
+// ─── DETAIL COLLECTION — INTERACTION ROUTER ───────────────────────────────────
+async function handleDetailInteraction(interaction) {
+  const parsed = parseCid(interaction.customId);
+  if (!parsed) return;
+  const { action, key, token } = parsed;
+
+  const ctx  = dealState[key];
+  const deal = ctx?.deal;
+
+  // A deal that has ended leaves its buttons behind; the token makes them inert
+  // instead of writing into whatever deal is running now.
+  if (!deal || deal.dealToken !== token) {
+    return interaction.reply({ content: "⚠️ That deal has ended — these buttons are no longer active.", ephemeral: true });
+  }
+
+  const guild = interaction.guild;
+
+  // ── Staff-only: post the buyer's payout block on demand ────────────────────
+  if (action === "postpayout") {
+    if (!STAFF[interaction.user.id]) {
+      return interaction.reply({ content: "❌ Staff only.", ephemeral: true });
+    }
+    if (!deal.buyerPayout) {
+      return interaction.reply({ content: "❌ The buyer hasn't submitted payout details yet.", ephemeral: true });
+    }
+    await interaction.deferReply({ ephemeral: true });
+    await postBuyerPayout(guild, key, deal, `💰 Payment confirmed by <@${interaction.user.id}>`);
+    return interaction.editReply({ content: "✅ Payout details posted in the channel." });
+  }
+
+  // ── Everything else is locked to the party it belongs to ───────────────────
+  const forSeller  = action.startsWith("seller") || action === "bankpick" || action === "relpick";
+  const expectedId = forSeller ? deal.sellerId : deal.buyerId;
+  if (interaction.user.id !== expectedId) {
+    return interaction.reply({ content: `❌ This is for <@${expectedId}> only.`, ephemeral: true });
+  }
+
+  const member = interaction.member;
+  const pk     = pKey(key, interaction.user.id);
+
+  // ── Seller: choose from previously used accounts ───────────────────────────
+  if (action === "sellerpick") {
+    await interaction.deferReply({ ephemeral: true });
+    const rows  = await getDetailsRows();
+    const saved = rows ? findSellerAccounts(rows, deal.sellerId) : [];
+    if (saved.length === 0) {
+      return interaction.editReply({ content: "No saved accounts found. Tap **💳 Seller — Bank Details** to add one." });
+    }
+    const menu = new StringSelectMenuBuilder()
+      .setCustomId(cid("sellersaved", key, token))
+      .setPlaceholder("Choose the account to receive PKR")
+      .addOptions(saved.slice(0, 25).map((a, i) => ({
+        label: `${a.bank || "Bank"} ${maskTail(a.account)}`.slice(0, 100),
+        description: `${a.title}${isSelfRelation(a.relation) ? "" : ` · ${a.relation}`}`.slice(0, 100),
+        value: String(i)
+      })));
+    return interaction.editReply({
+      content: "🔎 Accounts you've used before:",
+      components: [
+        new ActionRowBuilder().addComponents(menu),
+        new ActionRowBuilder().addComponents(new ButtonBuilder()
+          .setCustomId(cid("sellernew", key, token)).setLabel("➕ Use a Different Account").setStyle(ButtonStyle.Secondary))
+      ]
+    });
+  }
+
+  if (action === "sellersaved") {
+    await interaction.deferUpdate();
+    const rows  = await getDetailsRows();
+    const saved = rows ? findSellerAccounts(rows, deal.sellerId) : [];
+    const a     = saved[parseInt(interaction.values[0], 10)];
+    if (!a) return interaction.editReply({ content: "⚠️ That account is no longer available. Please add it again.", components: [] });
+
+    deal.sellerBank = { ...a, knownAccount: true };
+    saveDeal(deal, ctx.file);
+    await interaction.editReply({ content: `✅ Using your **${a.bank}** account ending ${maskTail(a.account)}.`, components: [] });
+    return dvaChannelFor(guild, key).send(`✅ <@${deal.sellerId}> has submitted their bank details.`);
+  }
+
+  // ── Seller: new account — bank + relation pickers, then the modal ──────────
+  if (action === "sellernew") {
+    // Without the sheet's dropdown lists, fall back to typing the bank by hand
+    // rather than blocking the deal.
+    if (!dropdownCache.banks) {
+      pendingBank.set(pk, { bank: null, relation: "Self" });
+      return interaction.showModal(sellerModal(key, token, true));
+    }
+    pendingBank.set(pk, { bank: null, relation: null });
+    return interaction.reply({
+      ephemeral: true,
+      content: "Step 1 of 2 — pick your bank and your relation to the account, then press Continue.",
+      components: [
+        new ActionRowBuilder().addComponents(new StringSelectMenuBuilder()
+          .setCustomId(cid("bankpick", key, token)).setPlaceholder("Bank / Wallet").addOptions(bankSelectOptions())),
+        new ActionRowBuilder().addComponents(new StringSelectMenuBuilder()
+          .setCustomId(cid("relpick", key, token)).setPlaceholder("Relation with account").addOptions(relationSelectOptions())),
+        new ActionRowBuilder().addComponents(new ButtonBuilder()
+          .setCustomId(cid("sellercont", key, token)).setLabel("Continue →").setStyle(ButtonStyle.Primary))
+      ]
+    });
+  }
+
+  if (action === "bankpick" || action === "relpick") {
+    const p = pendingBank.get(pk) || { bank: null, relation: null };
+    if (action === "bankpick") p.bank = interaction.values[0];
+    else                       p.relation = interaction.values[0];
+    pendingBank.set(pk, p);
+    return interaction.deferUpdate();
+  }
+
+  if (action === "sellercont") {
+    const p = pendingBank.get(pk);
+    if (!p?.bank || !p?.relation) {
+      return interaction.reply({ content: "❌ Please choose both a bank and a relation first.", ephemeral: true });
+    }
+    return interaction.showModal(sellerModal(key, token, p.bank === OTHER_BANK));
+  }
+
+  if (action === "sellermodal") {
+    await interaction.deferReply({ ephemeral: true });
+    // The bank field only exists when "Other…" was picked (or the dropdowns were
+    // unreachable). A restart between the picker and the modal can drop the
+    // pending selection, so read defensively rather than throwing on the party.
+    const field = id => { try { return interaction.fields.getTextInputValue(id).trim(); } catch { return ""; } };
+    const p = pendingBank.get(pk) || {};
+    const bank = {
+      title:    field("title"),
+      bank:     (p.bank && p.bank !== OTHER_BANK) ? p.bank : (field("bank") || "Unspecified"),
+      relation: p.relation || "Self",
+      account:  field("account"),
+      iban:     field("iban")
+    };
+    pendingBank.delete(pk);
+
+    const res = await recordSellerBank(member, bank);
+    deal.sellerBank = { ...bank, knownAccount: res.known };
+    saveDeal(deal, ctx.file);
+
+    await interaction.editReply({
+      content: `✅ Bank details recorded — **${bank.bank}**, ${maskTail(bank.account)}.\n` +
+               (res.ok ? "" : "⚠️ Could not write to the Details Log (sheet unreachable) — staff have been notified.\n") +
+               "Tap the button again any time to correct them."
+    });
+    return dvaChannelFor(guild, key).send(
+      `✅ <@${deal.sellerId}> has submitted their bank details.` + (res.ok ? "" : `\n⚠️ Not saved to Details Log — sheet unreachable.`)
+    );
+  }
+
+  // ── Buyer: choose a previously used Binance account ────────────────────────
+  if (action === "buyerpick") {
+    await interaction.deferReply({ ephemeral: true });
+    const rows  = await getDetailsRows();
+    const saved = rows ? findBuyerAccounts(rows, deal.buyerId) : [];
+    if (saved.length === 0) {
+      return interaction.editReply({ content: "No saved Binance accounts found. Tap **🏦 Buyer — Payout Details** to add one." });
+    }
+    const menu = new StringSelectMenuBuilder()
+      .setCustomId(cid("buyersaved", key, token))
+      .setPlaceholder("Choose where to receive USDT")
+      .addOptions(saved.slice(0, 25).map((a, i) => ({
+        label: `${a.binanceId}`.slice(0, 100),
+        description: (a.binanceName || "—").slice(0, 100),
+        value: String(i)
+      })));
+    return interaction.editReply({
+      content: "🔎 Binance accounts you've used before:",
+      components: [
+        new ActionRowBuilder().addComponents(menu),
+        new ActionRowBuilder().addComponents(new ButtonBuilder()
+          .setCustomId(cid("buyernew", key, token)).setLabel("➕ Use a Different Account").setStyle(ButtonStyle.Secondary))
+      ]
+    });
+  }
+
+  if (action === "buyersaved") {
+    await interaction.deferUpdate();
+    const rows  = await getDetailsRows();
+    const saved = rows ? findBuyerAccounts(rows, deal.buyerId) : [];
+    const a     = saved[parseInt(interaction.values[0], 10)];
+    if (!a) return interaction.editReply({ content: "⚠️ That account is no longer available. Please add it again.", components: [] });
+
+    deal.buyerPayout = { ...a, wallet: "", network: "", knownAccount: true };
+    saveDeal(deal, ctx.file);
+    await interaction.editReply({ content: `✅ Using Binance ID \`${a.binanceId}\`.`, components: [] });
+    return dvaChannelFor(guild, key).send(`✅ <@${deal.buyerId}> has submitted their payout details.`);
+  }
+
+  if (action === "buyernew") {
+    return interaction.showModal(buyerModal(key, token));
+  }
+
+  if (action === "buyermodal") {
+    await interaction.deferReply({ ephemeral: true });
+    const payout = {
+      binanceId:   interaction.fields.getTextInputValue("binanceId").trim(),
+      binanceName: interaction.fields.getTextInputValue("binanceName").trim(),
+      wallet:      interaction.fields.getTextInputValue("wallet").trim(),
+      network:     interaction.fields.getTextInputValue("network").trim()
+    };
+
+    const res = await recordBuyerPayout(member, payout);
+    deal.buyerPayout = { ...payout, knownAccount: res.known };
+    saveDeal(deal, ctx.file);
+
+    await interaction.editReply({
+      content: `✅ Payout details recorded — Binance ID \`${payout.binanceId}\`.\n` +
+               (res.ok ? "" : "⚠️ Could not write to the Details Log (sheet unreachable) — staff have been notified.\n") +
+               "Tap the button again any time to correct them."
+    });
+    return dvaChannelFor(guild, key).send(
+      `✅ <@${deal.buyerId}> has submitted their payout details.` + (res.ok ? "" : `\n⚠️ Not saved to Details Log — sheet unreachable.`)
+    );
+  }
+}
+
 client.on("interactionCreate", async interaction => {
   if (interaction.isChatInputCommand() && interaction.commandName === "fee") {
     return feeCommand.execute(interaction);
+  }
+
+  if (interaction.isButton() || interaction.isStringSelectMenu() || interaction.isModalSubmit()) {
+    return handleDetailInteraction(interaction).catch(e => {
+      console.error("[DVA] Detail interaction error:", e);
+      const msg = { content: "❌ Something went wrong. Please try again, or share the details in chat.", ephemeral: true };
+      return (interaction.replied || interaction.deferred ? interaction.followUp(msg) : interaction.reply(msg)).catch(() => {});
+    });
   }
 
   if (!interaction.isChatInputCommand() || interaction.commandName !== "dva") return;
@@ -671,7 +1329,14 @@ client.on("interactionCreate", async interaction => {
       escrowAmount: null,
       booster:      null,
       boosterName:  null,
-      released:     false
+      released:     false,
+      // Party details — wiped with the deal file on close/cancel, never logged to Fund Log
+      dealToken:    Date.now().toString(36),
+      sellerBank:   null,
+      buyerPayout:  null,
+      payoutPosted: false,
+      payoutNudged: false,
+      detailMsgIds: []
     };
     saveDeal(ctx.deal, ctx.file);
 
@@ -681,6 +1346,21 @@ client.on("interactionCreate", async interaction => {
       `👤 **Seller:** <@${seller.id}> *(Selling USDT)*\n\n` +
       `${STAFF[staffId].message}`
     );
+
+    // Offer returning traders their previously used accounts instead of retyping.
+    await refreshDropdowns();
+    const detailRows  = await getDetailsRows();
+    const sellerSaved = detailRows ? findSellerAccounts(detailRows, seller.id).length > 0 : false;
+    const buyerSaved  = detailRows ? findBuyerAccounts(detailRows, buyer.id).length  > 0 : false;
+
+    await dvaChannel.send({
+      content:
+        `📋 **Both parties — please submit your details below.**\n` +
+        `<@${seller.id}> — the account where you will receive PKR.\n` +
+        `<@${buyer.id}> — the Binance account where you will receive USDT.\n` +
+        (detailRows === null ? `\n⚠️ Details Log is unreachable right now — entries may not be saved.` : ``),
+      components: [detailButtonsRow(key, ctx.deal.dealToken, sellerSaved, buyerSaved)]
+    });
 
     const buySellChannel = guild.channels.cache.get(BUYSELL_CHANNEL_ID);
     if (buySellChannel) {
@@ -726,6 +1406,35 @@ client.on("interactionCreate", async interaction => {
     });
   }
 
+  // ── /dva details ────────────────────────────────────────────────────────────
+  // Staff-only view of everything both parties submitted, with a button to push
+  // the buyer's payout block into the channel when the image trigger didn't fire.
+  if (sub === "details") {
+    if (!ctx.deal) return interaction.reply({ content: "❌ No active deal.", ephemeral: true });
+
+    const d       = ctx.deal;
+    const sMember = guild.members.cache.get(d.sellerId);
+    const bMember = guild.members.cache.get(d.buyerId);
+
+    const lines = [`📋 **Deal details** — <@${d.buyerId}> *(buyer)* ↔ <@${d.sellerId}> *(seller)*`, ``];
+    lines.push(d.sellerBank
+      ? sellerBankBlock(d, sMember)
+      : `🏦 **Seller's Receiving Account**\n   ⚠️ Not submitted yet.`);
+    lines.push(``);
+    lines.push(d.buyerPayout
+      ? buyerPayoutBlock(d, bMember)
+      : `🏦 **Buyer's Payout Account**\n   ⚠️ Not submitted yet.`);
+
+    const rows = [];
+    if (d.buyerPayout) {
+      rows.push(new ActionRowBuilder().addComponents(new ButtonBuilder()
+        .setCustomId(cid("postpayout", key, d.dealToken))
+        .setLabel(d.payoutPosted ? "📤 Post Payout Again" : "📤 Post Payout to Channel")
+        .setStyle(ButtonStyle.Primary)));
+    }
+    return interaction.reply({ content: lines.join("\n"), components: rows, ephemeral: true });
+  }
+
   // ── /dva confirm ────────────────────────────────────────────────────────────
   if (sub === "confirm") {
     if (!ctx.deal)                    return interaction.reply({ content: "❌ No active deal.", ephemeral: true });
@@ -763,31 +1472,36 @@ client.on("interactionCreate", async interaction => {
       if (boosterMember) discountTag = `🎉 Booster discount applied for <@${boosterMember.id}> — Fee: **0.5%**`;
     }
 
+    let note;
     if (boosterMember) {
       ctx.deal.feePercent      = 0.5;
       ctx.deal.booster         = boosterMember.id;
       ctx.deal.boosterCampaign = isCampaignDeal;
       ctx.deal.boosterName  = boosterMember.user.username;
       ctx.deal.escrowAmount = parseFloat((amount - amount * 0.005).toFixed(4));
-      await dvaChannel.send(
-        `✅ ${amount} USDT received\n` +
-        `🔒 ${ctx.deal.escrowAmount} USDT escrow\n\n` +
-        `${discountTag}\n\n` +
-        `<@${ctx.deal.buyerId}> Please send funds to <@${ctx.deal.sellerId}>`
-      );
+      note = `\n\n${discountTag}`;
     } else {
       ctx.deal.feePercent   = 1;
       ctx.deal.escrowAmount = parseFloat((amount - amount * 0.01).toFixed(4));
-      const feeNote = amount >= BOOSTER_THRESHOLD ? "\n\n📋 Fee: **1%**" : "";
-      await dvaChannel.send(
-        `✅ ${amount} USDT received\n` +
-        `🔒 ${ctx.deal.escrowAmount} USDT escrow${feeNote}\n\n` +
-        `<@${ctx.deal.buyerId}> Please send funds to <@${ctx.deal.sellerId}>`
-      );
+      note = amount >= BOOSTER_THRESHOLD ? "\n\n📋 Fee: **1%**" : "";
     }
+
+    const confirmMsg = await dvaChannel.send(
+      `✅ ${amount} USDT received\n` +
+      `🔒 ${ctx.deal.escrowAmount} USDT escrow${note}\n\n` +
+      `${sellerBlockOrWarning(ctx.deal, sMember)}\n\n` +
+      `<@${ctx.deal.buyerId}> Please send funds to <@${ctx.deal.sellerId}>`
+    );
+    if (ctx.deal.sellerBank) trackDetailMsg(ctx.deal, confirmMsg);
     saveDeal(ctx.deal, ctx.file);
 
-    return interaction.reply({ content: "✅ Escrow confirmed.", ephemeral: true });
+    let confirmReply = "✅ Escrow confirmed.";
+    if (!ctx.deal.sellerBank) {
+      confirmReply += `\n⚠️ Seller hasn't submitted bank details — collect manually or ask them to tap the button.`;
+    } else if (!isSelfRelation(ctx.deal.sellerBank.relation)) {
+      confirmReply += `\n⚠️ Seller's account is third-party (**${ctx.deal.sellerBank.relation}**) — warning posted in channel.`;
+    }
+    return interaction.reply({ content: confirmReply, ephemeral: true });
   }
 
   // ── /dva confirm-update ─────────────────────────────────────────────────────
@@ -816,11 +1530,13 @@ client.on("interactionCreate", async interaction => {
     ctx.deal.escrowAmount = parseFloat((ctx.deal.amount * (1 - feePct)).toFixed(4));
 
     const amountDisplay = formatAmountDisplay(ctx.deal);
-    await dvaChannel.send(
+    const updateMsg = await dvaChannel.send(
       `✅ ${amountDisplay} USDT received\n` +
       `🔒 ${ctx.deal.escrowAmount} USDT escrow\n\n` +
+      `${sellerBlockOrWarning(ctx.deal, guild.members.cache.get(ctx.deal.sellerId))}\n\n` +
       `<@${ctx.deal.buyerId}> Please send funds to <@${ctx.deal.sellerId}>`
     );
+    if (ctx.deal.sellerBank) trackDetailMsg(ctx.deal, updateMsg);
     saveDeal(ctx.deal, ctx.file);
 
     let replyMsg = "✅ Escrow amount updated.";
@@ -849,7 +1565,11 @@ client.on("interactionCreate", async interaction => {
     saveDeal(ctx.deal, ctx.file);
     startCloseReminder(key);
 
-    return interaction.editReply({ content: "✅ Escrow released. Use **/dva close** to finalize and log to Sheets." });
+    let releaseReply = "✅ Escrow released. Use **/dva close** to finalize and log to Sheets.";
+    if (!ctx.deal.buyerPayout) {
+      releaseReply += `\n⚠️ Buyer never submitted payout details — nothing was recorded in the Details Log for them.`;
+    }
+    return interaction.editReply({ content: releaseReply });
   }
 
   // ── /dva close ──────────────────────────────────────────────────────────────
@@ -880,10 +1600,26 @@ client.on("interactionCreate", async interaction => {
     clearDealFile(ctx.file);
     stopCloseReminder(key);
 
+    // Makes good on the SOP promise: every message the bot posted carrying bank
+    // or Binance details is removed. User messages and receipts are left alone.
+    await purgeDetailMsgs(dvaChannel, dealSnapshot);
+
     // Log to Sheets now that we know who closed (handles split if different staff)
     if (dealSnapshot.released) {
       const closerId = isOverride ? staffId : null;
       await logDeal(dealSnapshot, closerId).catch(e => console.error("[DVA] Sheet log error:", e));
+    }
+
+    // The VERIFIED role is the source of truth in both directions — a member who
+    // has lost it gets unticked, so the sheet can never show a stale ✅.
+    const verifyNotes = [];
+    for (const partyId of [dealSnapshot.buyerId, dealSnapshot.sellerId]) {
+      const m = await guild.members.fetch(partyId).catch(() => null);
+      const r = await syncVerified(m);
+      if (r) verifyNotes.push(
+        `${r.ticked ? "☑️" : "⬜"} Verified ${r.ticked ? "ticked" : "unticked"} in log for <@${partyId}> ` +
+        `(${r.rows} row${r.rows > 1 ? "s" : ""})`
+      );
     }
 
     setTimeout(async () => {
@@ -901,7 +1637,10 @@ client.on("interactionCreate", async interaction => {
       await buySellChannel.send(`🔔 Previous DVA has concluded. You may tag Staff again for DVA.`);
     }
 
-    return interaction.editReply({ content: "✅ Deal closed and logged to Google Sheets. Roles will be removed in 5 seconds." });
+    return interaction.editReply({
+      content: "✅ Deal closed and logged to Google Sheets. Roles will be removed in 5 seconds." +
+               (verifyNotes.length ? `\n\n${verifyNotes.join("\n")}` : "")
+    });
   }
 
   // ── /dva cancel ─────────────────────────────────────────────────────────────
@@ -916,6 +1655,10 @@ client.on("interactionCreate", async interaction => {
     ctx.deal = null;
     clearDealFile(ctx.file);
     stopCloseReminder(key);
+
+    // Details Log entries are kept on purpose — a cancelled deal is exactly when
+    // you want the account on record — but the channel messages still go.
+    await purgeDetailMsgs(dvaChannel, dealSnapshot);
 
     await dvaChannel.send(`❌ DVA deal cancelled.\n📝 Reason: ${reason}`);
 
@@ -939,6 +1682,37 @@ client.on("interactionCreate", async interaction => {
 // ─── STAFF MENTION LISTENER ───────────────────────────────────────────────────
 client.on("messageCreate", async message => {
   if (message.author.bot) return;
+
+  // ── RECEIPT IMAGE TRIGGER ───────────────────────────────────────────────────
+  // The bot can't read a receipt, only notice one. Guarding on buyer + live
+  // escrow + not-yet-released + once-per-deal keeps stray images from firing it.
+  const dealKey = message.channel.id === DVA_CHANNEL_ID      ? "normal"
+                : message.channel.id === DVA_CASH_CHANNEL_ID ? "cash"
+                : null;
+  if (dealKey) {
+    const deal = dealState[dealKey].deal;
+    if (!deal)                                     return;
+    if (message.author.id !== deal.buyerId)        return;
+    if (!deal.escrowAmount || deal.released)       return;
+    if (deal.payoutPosted)                         return;
+    if (!message.attachments.some(a => (a.contentType || "").startsWith("image/"))) return;
+
+    if (!deal.buyerPayout) {
+      // Nudge once, then stay armed so it fires properly once they've submitted.
+      if (deal.payoutNudged) return;
+      deal.payoutNudged = true;
+      saveDeal(deal, dealState[dealKey].file);
+      return message.reply(
+        `🧾 Receipt received — thanks!\n` +
+        `⚠️ <@${deal.buyerId}> you haven't submitted your Binance details yet. ` +
+        `Tap **🏦 Buyer — Payout Details** above so staff know where to release your USDT.`
+      ).catch(() => {});
+    }
+
+    return postBuyerPayout(message.guild, dealKey, deal, `🧾 Receipt received from <@${deal.buyerId}>`)
+      .catch(e => console.error("[DVA] Receipt trigger error:", e));
+  }
+
   if (message.channel.id !== BUYSELL_CHANNEL_ID) return;
   if (!message.mentions.roles.has(STAFF_ROLE_ID)) return;
 
@@ -964,6 +1738,7 @@ process.on("uncaughtException",  err => console.error("[DVA] Uncaught exception:
 client.once("ready", async () => {
   console.log(`[DVA] Bot online as ${client.user.tag}`);
   await registerCommands();
+  await refreshDropdowns(true).catch(e => console.error("[DVA] Dropdown load error:", e));
   await checkMissedArchive().catch(e => console.error("[DVA] Startup archive check error:", e));
 
   // Restart close reminders for any deals that were released but never closed before restart
