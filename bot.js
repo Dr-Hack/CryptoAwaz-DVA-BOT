@@ -1,6 +1,6 @@
 // DVA Bot - bot.js
-// Version: 1.31
-// Last Modified: 2026-08-28
+// Version: 1.32
+// Last Modified: 2026-08-29
 // Dependencies: discord.js@14, googleapis, dotenv, node-cron
 // Install: npm install discord.js googleapis dotenv node-cron
 
@@ -808,7 +808,7 @@ function badgeLine(member, knownAccount) {
 function sellerBankBlock(deal, sellerMember) {
   const b = deal.sellerBank;
   const lines = [
-    `🏦 **Seller's Receiving Account**`,
+    `🏦 **<@${deal.sellerId}> (Seller) — Bank Details**`,
     `   Title:    \`${b.title}\``,
     `   Bank:     \`${b.bank}\``,
     `   Account:  \`${b.account}\``
@@ -829,7 +829,9 @@ function sellerBankBlock(deal, sellerMember) {
 function buyerPayoutBlock(deal, buyerMember) {
   const p = deal.buyerPayout;
   const lines = [
-    `🏦 **Once confirmed, release USDT to <@${deal.buyerId}>:**`,
+    // Tagged so the staff member running the deal gets a ping to come back to it.
+    // "Crypto" rather than "USDT" — almost always USDT, but not guaranteed.
+    `🏦 **Once confirmed, <@${deal.staffId}> please release Crypto to <@${deal.buyerId}>:**`,
     `   Binance ID:   \`${p.binanceId}\``,
     `   Binance Name: \`${p.binanceName}\``
   ];
@@ -1065,7 +1067,8 @@ async function handleDetailInteraction(interaction) {
   }
 
   // ── Everything else is locked to the party it belongs to ───────────────────
-  const forSeller  = action.startsWith("seller") || action === "bankpick" || action === "relpick";
+  const forSeller  = action.startsWith("seller") || action.startsWith("iban")
+                  || action === "bankpick" || action === "relpick";
   const expectedId = forSeller ? deal.sellerId : deal.buyerId;
   if (interaction.user.id !== expectedId) {
     return interaction.reply({ content: `❌ This is for <@${expectedId}> only.`, ephemeral: true });
@@ -1109,17 +1112,67 @@ async function handleDetailInteraction(interaction) {
 
     deal.sellerBank = { ...a, knownAccount: true };
     saveDeal(deal, ctx.file);
+
     // Keep a way out — picking a saved account must not be a dead end.
+    const rows2 = [new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(cid("sellerpick", key, token))
+        .setLabel("💳 Pick Another Saved").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(cid("sellernew", key, token))
+        .setLabel("➕ Enter a Different Account").setStyle(ButtonStyle.Secondary)
+    )];
+    // An older row may predate the IBAN field. Offer to top it up rather than
+    // making them re-enter the whole account, which would only match and no-op.
+    if (!a.iban) {
+      rows2.unshift(new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(cid("ibanadd", key, token))
+          .setLabel("➕ Add IBAN to this account").setStyle(ButtonStyle.Primary)
+      ));
+    }
+
     await interaction.editReply({
-      content: `✅ Using your **${a.bank}** account ending ${maskTail(a.account)}.\nWrong one? Use the buttons below.`,
-      components: [new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId(cid("sellerpick", key, token))
-          .setLabel("💳 Pick Another Saved").setStyle(ButtonStyle.Secondary),
-        new ButtonBuilder().setCustomId(cid("sellernew", key, token))
-          .setLabel("➕ Enter a Different Account").setStyle(ButtonStyle.Secondary)
-      )]
+      content: `✅ Using your **${a.bank}** account ending ${maskTail(a.account)}.` +
+               (a.iban ? `` : `\nThis account has no IBAN saved — add one below if you'd like it shown.`) +
+               `\nWrong account? Use the buttons below.`,
+      components: rows2
     });
     return dvaChannelFor(guild, key).send(`✅ <@${deal.sellerId}> has submitted their bank details.`);
+  }
+
+  // ── Backfill an IBAN onto an existing Details Log row ──────────────────────
+  if (action === "ibanadd") {
+    if (!deal.sellerBank) {
+      return interaction.reply({ content: "❌ Pick an account first.", ephemeral: true });
+    }
+    return interaction.showModal(new ModalBuilder()
+      .setCustomId(cid("ibanmodal", key, token))
+      .setTitle("Add IBAN")
+      .addComponents(new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId("iban").setLabel("IBAN")
+          .setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(40)
+      )));
+  }
+
+  if (action === "ibanmodal") {
+    await interaction.deferReply({ ephemeral: true });
+    const iban = interaction.fields.getTextInputValue("iban").trim();
+    if (!deal.sellerBank) return interaction.editReply({ content: "❌ Pick an account first." });
+
+    deal.sellerBank.iban = iban;
+    saveDeal(deal, ctx.file);
+
+    // Only ever writes the one empty IBAN cell on the row they picked.
+    let warn = "";
+    if (deal.sellerBank.rowNum) {
+      const res = await trySheet("IBAN backfill", async () =>
+        getSheets().spreadsheets.values.update({
+          spreadsheetId: SHEET_ID,
+          range: `${DETAILS_TAB}!H${deal.sellerBank.rowNum}`,
+          valueInputOption: "USER_ENTERED",
+          requestBody: { values: [[iban]] }
+        }));
+      if (res === null) warn = `\n⚠️ Saved for this deal, but the sheet could not be updated.`;
+    }
+    return interaction.editReply({ content: `✅ IBAN added: \`${iban}\`${warn}` });
   }
 
   // ── Seller: new account — bank + relation pickers, then the modal ──────────
@@ -1478,11 +1531,11 @@ client.on("interactionCreate", async interaction => {
     const lines = [`📋 **Deal details** — <@${d.buyerId}> *(buyer)* ↔ <@${d.sellerId}> *(seller)*`, ``];
     lines.push(d.sellerBank
       ? sellerBankBlock(d, sMember)
-      : `🏦 **Seller's Receiving Account**\n   ⚠️ Not submitted yet.`);
+      : `🏦 **<@${d.sellerId}> (Seller) — Bank Details**\n   ⚠️ Not submitted yet.`);
     lines.push(``);
     lines.push(d.buyerPayout
       ? buyerPayoutBlock(d, bMember)
-      : `🏦 **Buyer's Payout Account**\n   ⚠️ Not submitted yet.`);
+      : `🏦 **<@${d.buyerId}> (Buyer) — Payout Details**\n   ⚠️ Not submitted yet.`);
 
     const rows = [];
     if (d.buyerPayout) {
