@@ -1,5 +1,5 @@
 // DVA Bot - bot.js
-// Version: 1.33
+// Version: 1.34
 // Last Modified: 2026-08-30
 // Dependencies: discord.js@14, googleapis, dotenv, node-cron
 // Install: npm install discord.js googleapis dotenv node-cron
@@ -60,7 +60,9 @@ const MONTH_NAMES         = ["January","February","March","April","May","June","
 //   9 J Binance Name | 10 K Phone No. | 11 L Comments
 // The bot never writes columns K or L. Column B is driven by the VERIFIED role.
 const DETAILS_TAB   = "Details Log";
-const DCOL = { NAME: 0, VERIFIED: 1, UID: 2, TITLE: 3, BANK: 4, RELATION: 5, ACCOUNT: 6, IBAN: 7, BINANCE_ID: 8, BINANCE_NAME: 9 };
+const DCOL = { NAME: 0, VERIFIED: 1, UID: 2, TITLE: 3, BANK: 4, RELATION: 5, ACCOUNT: 6, IBAN: 7,
+                BINANCE_ID: 8, BINANCE_NAME: 9, PHONE: 10, COMMENTS: 11, ADDRESS: 12, NETWORK: 13 };
+const DETAILS_WIDTH = 14;
 
 // Discord caps select menus at 25 options, so 24 banks + "Other…" is the ceiling.
 // Anything past 24 in the sheet folds into "Other…" (free-text entry).
@@ -217,7 +219,7 @@ function isSelfRelation(relation) {
 // ─── DETAILS LOG — READ ───────────────────────────────────────────────────────
 async function getDetailsRows() {
   const rows = await trySheet("Details Log read", async () =>
-    getRange(getSheets(), `${DETAILS_TAB}!A2:L`));   // A1:L1 is the header row
+    getRange(getSheets(), `${DETAILS_TAB}!A2:N`));   // A1:N1 is the header row
   return rows;   // null signals the sheet was unreachable
 }
 
@@ -247,12 +249,23 @@ function findBuyerAccounts(rows, uid) {
   const seen = new Set();
   for (const r of rows || []) {
     if (r[DCOL.UID] !== uid) continue;
-    const ids    = splitMulti(r[DCOL.BINANCE_ID]);
-    const names  = splitMulti(r[DCOL.BINANCE_NAME]);
+
+    const ids   = splitMulti(r[DCOL.BINANCE_ID]);
+    const names = splitMulti(r[DCOL.BINANCE_NAME]);
     ids.forEach((id, i) => {
       if (seen.has(id)) return;
       seen.add(id);
-      out.push({ binanceId: id, binanceName: names[i] || "" });
+      out.push({ binanceId: id, binanceName: names[i] || "", wallet: "", network: "" });
+    });
+
+    // Wallets are offered alongside exchange accounts, so a buyer who was paid
+    // on-chain last time can pick that address again instead of retyping it.
+    const wallets  = splitMulti(r[DCOL.ADDRESS]);
+    const networks = splitMulti(r[DCOL.NETWORK]);
+    wallets.forEach((w, i) => {
+      if (seen.has(w)) return;
+      seen.add(w);
+      out.push({ binanceId: "", binanceName: "", wallet: w, network: networks[i] || "" });
     });
   }
   return out;
@@ -269,7 +282,7 @@ async function appendDetailsRow(row) {
     const sheets = getSheets();
     return sheets.spreadsheets.values.append({
       spreadsheetId: SHEET_ID,
-      range: `${DETAILS_TAB}!A:L`,
+      range: `${DETAILS_TAB}!A:N`,
       valueInputOption: "USER_ENTERED",
       requestBody: { values: [row] }
     });
@@ -285,7 +298,7 @@ async function recordSellerBank(member, bank) {
     .find(a => a.account.replace(/\s/g, "") === bank.account.replace(/\s/g, ""));
   if (existing) return { ok: true, added: false, known: true };
 
-  const row = Array(12).fill("");
+  const row = Array(DETAILS_WIDTH).fill("");
   row[DCOL.NAME]     = member.user.username;
   row[DCOL.UID]      = member.id;
   row[DCOL.TITLE]    = bank.title;
@@ -300,12 +313,21 @@ async function recordSellerBank(member, bank) {
 // A new Binance ID fills every empty Binance cell this person has, and is appended
 // as "old / new" where one is already present. Only if they have no rows at all
 // does a fresh row get created.
-async function recordBuyerPayout(member, payout) {
-  // The Details Log has no wallet column, so a wallet-only payout has nothing to
-  // record. Writing an empty Binance ID would append junk, or worse corrupt an
-  // existing cell into "1234 / ". Skip the sheet entirely and say so.
-  if (!payout.binanceId) return { ok: true, added: false, known: false, noBinance: true };
+// Appends a value to a "a / b" cell, skipping it if already present and padding
+// the paired cell so the Nth entry always lines up with the Nth partner.
+function mergeMulti(currentValue, currentPartner, addValue, addPartner) {
+  const values = splitMulti(currentValue);
+  if (values.includes(addValue)) return null;              // already recorded
 
+  const partners = splitMulti(currentPartner);
+  while (partners.length < values.length) partners.push("—");
+
+  return values.length
+    ? [`${currentValue}${MULTI_SEP}${addValue}`, `${partners.join(MULTI_SEP)}${MULTI_SEP}${addPartner || "—"}`]
+    : [addValue, addPartner || ""];
+}
+
+async function recordBuyerPayout(member, payout) {
   const rows = await getDetailsRows();
   if (rows === null) return { ok: false };
 
@@ -314,43 +336,47 @@ async function recordBuyerPayout(member, payout) {
     .filter(({ r }) => r[DCOL.UID] === member.id);
 
   if (mine.length === 0) {
-    const row = Array(12).fill("");
+    const row = Array(DETAILS_WIDTH).fill("");
     row[DCOL.NAME]         = member.user.username;
     row[DCOL.UID]          = member.id;
-    row[DCOL.BINANCE_ID]   = payout.binanceId;
+    row[DCOL.BINANCE_ID]   = payout.binanceId   || "";
     row[DCOL.BINANCE_NAME] = payout.binanceName || "";
+    row[DCOL.ADDRESS]      = payout.wallet      || "";
+    row[DCOL.NETWORK]      = payout.network     || "";
     const res = await appendDetailsRow(row);
     return { ok: res !== null, added: res !== null, known: false };
   }
 
+  // Binance ID/Name and Address/Network are two independent paired columns, so a
+  // buyer can add a wallet to rows that already carry an exchange ID and back.
   const updates = [];
-  let alreadyKnown = false;
+  let knownId = false, knownWallet = false;
 
   for (const { r, rowNum } of mine) {
-    const ids = splitMulti(r[DCOL.BINANCE_ID]);
-    if (ids.includes(payout.binanceId)) { alreadyKnown = true; continue; }
-
-    const names   = splitMulti(r[DCOL.BINANCE_NAME]);
-    // Pad names so the Nth id always lines up with the Nth name.
-    while (names.length < ids.length) names.push("—");
-
-    const newId   = ids.length   ? `${r[DCOL.BINANCE_ID]}${MULTI_SEP}${payout.binanceId}` : payout.binanceId;
-    const newName = ids.length   ? `${names.join(MULTI_SEP)}${MULTI_SEP}${payout.binanceName || "—"}`
-                                 : (payout.binanceName || "");
-
-    updates.push({ range: `${DETAILS_TAB}!I${rowNum}:J${rowNum}`, values: [[newId, newName]] });
+    if (payout.binanceId) {
+      const merged = mergeMulti(r[DCOL.BINANCE_ID], r[DCOL.BINANCE_NAME], payout.binanceId, payout.binanceName);
+      if (merged) updates.push({ range: `${DETAILS_TAB}!I${rowNum}:J${rowNum}`, values: [merged] });
+      else knownId = true;
+    }
+    if (payout.wallet) {
+      const merged = mergeMulti(r[DCOL.ADDRESS], r[DCOL.NETWORK], payout.wallet, payout.network);
+      if (merged) updates.push({ range: `${DETAILS_TAB}!M${rowNum}:N${rowNum}`, values: [merged] });
+      else knownWallet = true;
+    }
   }
 
-  if (updates.length === 0) return { ok: true, added: false, known: alreadyKnown };
+  // "Known" means every account they gave us was already on record.
+  const known = (!payout.binanceId || knownId) && (!payout.wallet || knownWallet);
+  if (updates.length === 0) return { ok: true, added: false, known };
 
-  const res = await trySheet("Details Log binance update", async () => {
+  const res = await trySheet("Details Log payout update", async () => {
     const sheets = getSheets();
     return sheets.spreadsheets.values.batchUpdate({
       spreadsheetId: SHEET_ID,
       requestBody: { valueInputOption: "USER_ENTERED", data: updates }
     });
   });
-  return { ok: res !== null, added: res !== null, known: alreadyKnown };
+  return { ok: res !== null, added: res !== null, known };
 }
 
 // ─── VERIFIED ROLE SYNC ───────────────────────────────────────────────────────
@@ -1288,18 +1314,20 @@ async function handleDetailInteraction(interaction) {
     const rows  = await getDetailsRows();
     const saved = rows ? findBuyerAccounts(rows, deal.buyerId) : [];
     if (saved.length === 0) {
-      return interaction.editReply({ content: "No saved Binance accounts found. Tap **🏦 Buyer — Payout Details** to add one." });
+      return interaction.editReply({ content: "No saved payout accounts found. Tap **🏦 Buyer — Payout Details** to add one." });
     }
     const menu = new StringSelectMenuBuilder()
       .setCustomId(cid("buyersaved", key, token))
-      .setPlaceholder("Choose where to receive USDT")
+      .setPlaceholder("Choose where to receive crypto")
       .addOptions(saved.slice(0, 25).map((a, i) => ({
-        label: `${a.binanceId}`.slice(0, 100),
-        description: (a.binanceName || "—").slice(0, 100),
+        // The list mixes exchange accounts and wallets, so each entry says which.
+        label: (a.binanceId ? `Binance ${a.binanceId}` : `Wallet ${maskTail(a.wallet)}`).slice(0, 100),
+        description: (a.binanceId ? (a.binanceName || "—")
+                                  : (a.network || "network not recorded")).slice(0, 100),
         value: String(i)
       })));
     return interaction.editReply({
-      content: "🔎 Binance accounts you've used before:",
+      content: "🔎 Accounts you've used before:",
       components: [
         new ActionRowBuilder().addComponents(menu),
         new ActionRowBuilder().addComponents(new ButtonBuilder()
@@ -1315,14 +1343,18 @@ async function handleDetailInteraction(interaction) {
     const a     = saved[parseInt(interaction.values[0], 10)];
     if (!a) return interaction.editReply({ content: "⚠️ That account is no longer available. Please add it again.", components: [] });
 
-    deal.buyerPayout = { ...a, wallet: "", network: "", knownAccount: true };
+    // `a` already carries all four fields — never blank the wallet half here, or
+    // picking a saved wallet would wipe the very thing that was picked.
+    deal.buyerPayout = { ...a, knownAccount: true };
     saveDeal(deal, ctx.file);
-    // A saved Binance ID carries no wallet, so offer the route to add one.
     await interaction.editReply({
-      content: `✅ Using Binance ID \`${a.binanceId}\`.\nWant USDT sent to a wallet instead, or on a specific network? Add it below.`,
+      content: (a.binanceId
+        ? `✅ Using Binance ID \`${a.binanceId}\`.`
+        : `✅ Using wallet \`${a.wallet}\`${a.network ? ` on **${a.network}**` : ``}.`) +
+        `\nNeed a different account, or want to add both? Use the button below.`,
       components: [new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId(cid("buyernew", key, token))
-          .setLabel("➕ Add Wallet / Change Details").setStyle(ButtonStyle.Secondary)
+          .setLabel("➕ Add / Change Details").setStyle(ButtonStyle.Secondary)
       )]
     });
     return dvaChannelFor(guild, key).send(`✅ <@${deal.buyerId}> has submitted their payout details.`);
