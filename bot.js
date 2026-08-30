@@ -1,6 +1,6 @@
 // DVA Bot - bot.js
-// Version: 1.32
-// Last Modified: 2026-08-29
+// Version: 1.33
+// Last Modified: 2026-08-30
 // Dependencies: discord.js@14, googleapis, dotenv, node-cron
 // Install: npm install discord.js googleapis dotenv node-cron
 
@@ -301,6 +301,11 @@ async function recordSellerBank(member, bank) {
 // as "old / new" where one is already present. Only if they have no rows at all
 // does a fresh row get created.
 async function recordBuyerPayout(member, payout) {
+  // The Details Log has no wallet column, so a wallet-only payout has nothing to
+  // record. Writing an empty Binance ID would append junk, or worse corrupt an
+  // existing cell into "1234 / ". Skip the sheet entirely and say so.
+  if (!payout.binanceId) return { ok: true, added: false, known: false, noBinance: true };
+
   const rows = await getDetailsRows();
   if (rows === null) return { ok: false };
 
@@ -711,6 +716,8 @@ function parseCid(customId) {
 // Bank + Relation are picked before the modal opens, so their selections have to
 // live somewhere between interactions. Keyed by slot + user, cleared on submit.
 const pendingBank = new Map();
+// Holds a rejected payout draft so a retry reopens the form already filled in.
+const pendingPayout = new Map();
 const pKey = (key, userId) => `${key}:${userId}`;
 
 // One row per party. When a saved account exists the party gets both paths side
@@ -753,6 +760,23 @@ const withValue = (input, v) => (v ? input.setValue(String(v).slice(0, 100)) : i
 // one both belong to the seller. Under any other relation the name on the
 // account is someone else's by definition, and a stale pre-fill that goes
 // unnoticed would put the wrong name against a live bank transfer.
+// Enforces the rules the modal itself cannot: the buyer must give somewhere to
+// send to, an exchange ID needs the name on it, and a wallet without its network
+// is how people lose funds to the wrong chain.
+function validatePayout(p) {
+  const problems = [];
+  if (!p.binanceId && !p.wallet) {
+    problems.push("Give a **Binance ID** or a **wallet address** — whichever you want the crypto sent to.");
+  }
+  if (p.binanceId && !p.binanceName) {
+    problems.push("A Binance ID needs the **Binance name** on that account, so staff can check it matches before releasing.");
+  }
+  if (p.wallet && !p.network) {
+    problems.push("A wallet address needs its **network** (TRC-20 / BEP-20 / SOL). Sending on the wrong chain loses the funds.");
+  }
+  return problems;
+}
+
 function carryForwardTitle(prevBank, newRelation) {
   if (!prevBank || !prevBank.title)          return undefined;
   if (!isSelfRelation(newRelation))          return undefined;
@@ -784,14 +808,22 @@ function buyerModal(key, token, prefill = {}) {
     .setCustomId(cid("buyermodal", key, token))
     .setTitle("Buyer — Where to receive USDT")
     .addComponents(
+      // Every field is optional at the Discord level because a modal cannot make
+      // one field's requirement depend on another. A buyer who wants paying to a
+      // wallet must not be forced to invent a Binance ID. The combination is
+      // checked in the submit handler instead — see validatePayout().
       new ActionRowBuilder().addComponents(withValue(new TextInputBuilder().setCustomId("binanceId")
-        .setLabel("Binance ID").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(30), prefill.binanceId)),
+        .setLabel("Binance ID").setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(30)
+        .setPlaceholder("Leave blank if using a wallet instead"), prefill.binanceId)),
       new ActionRowBuilder().addComponents(withValue(new TextInputBuilder().setCustomId("binanceName")
-        .setLabel("Binance Name").setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(60), prefill.binanceName)),
+        .setLabel("Binance Name").setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(60)
+        .setPlaceholder("Name shown on your Binance account"), prefill.binanceName)),
       new ActionRowBuilder().addComponents(withValue(new TextInputBuilder().setCustomId("wallet")
-        .setLabel("Wallet Address (optional)").setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(120), prefill.wallet)),
+        .setLabel("Wallet Address").setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(120)
+        .setPlaceholder("Only if you'd rather be paid on-chain"), prefill.wallet)),
       new ActionRowBuilder().addComponents(withValue(new TextInputBuilder().setCustomId("network")
-        .setLabel("Network — TRC-20 / BEP-20 / SOL (optional)").setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(30), prefill.network))
+        .setLabel("Network — required with a wallet").setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(30)
+        .setPlaceholder("TRC-20 / BEP-20 / SOL"), prefill.network))
     );
 }
 
@@ -831,12 +863,13 @@ function buyerPayoutBlock(deal, buyerMember) {
   const lines = [
     // Tagged so the staff member running the deal gets a ping to come back to it.
     // "Crypto" rather than "USDT" — almost always USDT, but not guaranteed.
-    `🏦 **Once confirmed, <@${deal.staffId}> please release Crypto to <@${deal.buyerId}>:**`,
-    `   Binance ID:   \`${p.binanceId}\``,
-    `   Binance Name: \`${p.binanceName}\``
+    `🏦 **Once confirmed, <@${deal.staffId}> please release Crypto to <@${deal.buyerId}>:**`
   ];
-  if (p.wallet)  lines.push(`   Wallet:       \`${p.wallet}\``);
-  if (p.network) lines.push(`   Network:      \`${p.network}\``);
+  // A wallet-only buyer has no Binance ID, so print only what was actually given.
+  if (p.binanceId)   lines.push(`   Binance ID:   \`${p.binanceId}\``);
+  if (p.binanceName) lines.push(`   Binance Name: \`${p.binanceName}\``);
+  if (p.wallet)      lines.push(`   Wallet:       \`${p.wallet}\``);
+  if (p.network)     lines.push(`   Network:      \`${p.network}\``);
   lines.push(badgeLine(buyerMember, p.knownAccount));
   return lines.join("\n");
 }
@@ -1296,9 +1329,9 @@ async function handleDetailInteraction(interaction) {
   }
 
   if (action === "buyernew") {
-    // Pre-fill with whatever they already picked, so adding a wallet address
-    // does not mean retyping the Binance ID.
-    return interaction.showModal(buyerModal(key, token, deal.buyerPayout || {}));
+    // A rejected draft wins over the saved details, so a retry keeps their input.
+    return interaction.showModal(buyerModal(key, token,
+      pendingPayout.get(pk) || deal.buyerPayout || {}));
   }
 
   if (action === "buyermodal") {
@@ -1310,12 +1343,28 @@ async function handleDetailInteraction(interaction) {
       network:     interaction.fields.getTextInputValue("network").trim()
     };
 
+    // A modal cannot be reopened from a modal submit, so hand back a button —
+    // and keep the draft so nothing they typed has to be typed twice.
+    const problems = validatePayout(payout);
+    if (problems.length) {
+      pendingPayout.set(pk, payout);
+      return interaction.editReply({
+        content: `❌ Not saved yet:\n${problems.map(p => `• ${p}`).join("\n")}\n\nYour answers are kept — reopen the form to finish.`,
+        components: [new ActionRowBuilder().addComponents(new ButtonBuilder()
+          .setCustomId(cid("buyernew", key, token)).setLabel("↩️ Reopen Form").setStyle(ButtonStyle.Primary))]
+      });
+    }
+    pendingPayout.delete(pk);
+
     const res = await recordBuyerPayout(member, payout);
     deal.buyerPayout = { ...payout, knownAccount: res.known };
     saveDeal(deal, ctx.file);
 
+    const what = payout.binanceId
+      ? `Binance ID \`${payout.binanceId}\`${payout.wallet ? ` and wallet \`${payout.wallet}\`` : ``}`
+      : `wallet \`${payout.wallet}\` on **${payout.network}**`;
     await interaction.editReply({
-      content: `✅ Payout details recorded — Binance ID \`${payout.binanceId}\`.\n` +
+      content: `✅ Payout details recorded — ${what}.\n` +
                (res.ok ? "" : "⚠️ Could not write to the Details Log (sheet unreachable) — staff have been notified.\n") +
                "Tap the button again any time to correct them."
     });
