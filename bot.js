@@ -1,6 +1,6 @@
 // DVA Bot - bot.js
-// Version: 1.34
-// Last Modified: 2026-08-30
+// Version: 1.35
+// Last Modified: 2026-08-31
 // Dependencies: discord.js@14, googleapis, dotenv, node-cron
 // Install: npm install discord.js googleapis dotenv node-cron
 
@@ -1095,6 +1095,22 @@ async function postBuyerPayout(guild, key, deal, prefix) {
   return msg;
 }
 
+// What the channel sees when the buyer submits payout details. If their receipt
+// already arrived, the deal is waiting on nothing else — so go straight to the
+// release instruction rather than a bare acknowledgement staff would have to act
+// on separately. A correction after the block was posted re-posts it, because
+// staff must not send to a superseded address.
+async function announceBuyerPayout(guild, key, deal, note = "") {
+  if (deal.receiptSeen) {
+    const prefix = deal.payoutPosted
+      ? `♻️ <@${deal.buyerId}> has **updated** their payout details — use the ones below.`
+      : `✅ <@${deal.buyerId}> has now submitted their payout details.`;
+    return postBuyerPayout(guild, key, deal, prefix);
+  }
+  return dvaChannelFor(guild, key).send(
+    `✅ <@${deal.buyerId}> has submitted their payout details.${note}`);
+}
+
 // ─── DETAIL COLLECTION — INTERACTION ROUTER ───────────────────────────────────
 async function handleDetailInteraction(interaction) {
   const parsed = parseCid(interaction.customId);
@@ -1357,7 +1373,7 @@ async function handleDetailInteraction(interaction) {
           .setLabel("➕ Add / Change Details").setStyle(ButtonStyle.Secondary)
       )]
     });
-    return dvaChannelFor(guild, key).send(`✅ <@${deal.buyerId}> has submitted their payout details.`);
+    return announceBuyerPayout(guild, key, deal);
   }
 
   if (action === "buyernew") {
@@ -1400,9 +1416,8 @@ async function handleDetailInteraction(interaction) {
                (res.ok ? "" : "⚠️ Could not write to the Details Log (sheet unreachable) — staff have been notified.\n") +
                "Tap the button again any time to correct them."
     });
-    return dvaChannelFor(guild, key).send(
-      `✅ <@${deal.buyerId}> has submitted their payout details.` + (res.ok ? "" : `\n⚠️ Not saved to Details Log — sheet unreachable.`)
-    );
+    return announceBuyerPayout(guild, key, deal,
+      res.ok ? "" : `\n⚠️ Not saved to Details Log — sheet unreachable.`);
   }
 }
 
@@ -1526,6 +1541,7 @@ client.on("interactionCreate", async interaction => {
       buyerPayout:  null,
       payoutPosted: false,
       payoutNudged: false,
+      receiptSeen:  false,
       detailMsgIds: []
     };
     saveDeal(ctx.deal, ctx.file);
@@ -1890,9 +1906,13 @@ client.on("messageCreate", async message => {
     if (deal.payoutPosted)                         return;
     if (!message.attachments.some(a => (a.contentType || "").startsWith("image/"))) return;
 
+    // Remember a receipt arrived. Waiting for a second image would strand the
+    // deal — the buyer has no reason to post another one — so submitting their
+    // details is what completes the flow instead. See announceBuyerPayout().
+    deal.receiptSeen = true;
+
     if (!deal.buyerPayout) {
-      // Nudge once, then stay armed so it fires properly once they've submitted.
-      if (deal.payoutNudged) return;
+      if (deal.payoutNudged) { saveDeal(deal, dealState[dealKey].file); return; }
       deal.payoutNudged = true;
       saveDeal(deal, dealState[dealKey].file);
       return message.reply(
