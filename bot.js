@@ -1,5 +1,5 @@
 // DVA Bot - bot.js
-// Version: 1.35
+// Version: 1.36
 // Last Modified: 2026-08-31
 // Dependencies: discord.js@14, googleapis, dotenv, node-cron
 // Install: npm install discord.js googleapis dotenv node-cron
@@ -271,6 +271,73 @@ function findBuyerAccounts(rows, uid) {
   return out;
 }
 
+// ─── CROSS-MEMBER ACCOUNT CHECK ───────────────────────────────────────────────
+// One account appearing against two different Discord users is worth a look. It
+// is not proof of anything — siblings legitimately share a parent's account, and
+// the Relation field already covers declared sharing — so this reports the fact
+// and leaves the judgement to staff.
+const NORMALISE = {
+  ACCOUNT: v => v.replace(/[\s-]/g, ""),
+  IBAN:    v => v.replace(/[\s-]/g, "").toUpperCase(),
+  BINANCE: v => v.replace(/[\s-]/g, ""),
+  WALLET:  v => v.replace(/\s/g, "").toLowerCase()
+};
+const COLLISION_FIELDS = [
+  { kind: "ACCOUNT", label: "Bank account",   col: DCOL.ACCOUNT,    multi: false },
+  { kind: "IBAN",    label: "IBAN",           col: DCOL.IBAN,       multi: false },
+  { kind: "BINANCE", label: "Binance ID",     col: DCOL.BINANCE_ID, multi: true  },
+  { kind: "WALLET",  label: "Wallet address", col: DCOL.ADDRESS,    multi: true  }
+];
+
+// values: { ACCOUNT?, IBAN?, BINANCE?, WALLET? } — whatever this party just gave.
+function findAccountCollisions(rows, uid, values) {
+  const out = [];
+  for (const { kind, label, col, multi } of COLLISION_FIELDS) {
+    const raw = String(values[kind] || "").trim();
+    if (!raw) continue;
+    const needle = NORMALISE[kind](raw);
+    if (!needle) continue;
+
+    const others = new Map();          // otherUid -> { name, rows[] }
+    (rows || []).forEach((r, i) => {
+      const rowUid = String(r[DCOL.UID] || "").trim();
+      if (!rowUid || rowUid === uid) return;       // only a DIFFERENT member counts
+      const cellValues = multi ? splitMulti(r[col]) : [String(r[col] || "").trim()];
+      if (!cellValues.some(v => v && NORMALISE[kind](v) === needle)) return;
+
+      if (!others.has(rowUid)) others.set(rowUid, { name: String(r[DCOL.NAME] || "").trim(), rows: [] });
+      others.get(rowUid).rows.push(i + 2);
+    });
+
+    if (others.size) {
+      out.push({ kind, label, value: raw,
+                 users: [...others.entries()].map(([id, v]) => ({ id, ...v })) });
+    }
+  }
+  return out;
+}
+
+// Staff-facing summary. Never posted publicly — a false positive shown to the
+// counterparty accuses an innocent member in front of the person they trade with.
+function collisionNote(collisions, deal) {
+  if (!collisions || collisions.length === 0) return "";
+  const lines = [];
+  for (const c of collisions) {
+    // The other party in this same deal is a different matter entirely: it means
+    // one person is standing on both sides of the trade.
+    const counterparty = c.users.find(u => u.id === deal?.buyerId || u.id === deal?.sellerId);
+    if (counterparty) {
+      lines.push(`🚨 **${c.label}** \`${maskTail(c.value)}\` is also on record for <@${counterparty.id}> — **the other party in this deal**.`);
+    }
+    const rest = c.users.filter(u => u !== counterparty);
+    if (rest.length) {
+      lines.push(`🔍 **${c.label}** \`${maskTail(c.value)}\` also used by ` +
+        rest.map(u => `<@${u.id}>${u.name ? ` (${u.name})` : ``} · row${u.rows.length > 1 ? "s" : ""} ${u.rows.join(", ")}`).join(", "));
+    }
+  }
+  return lines.join("\n");
+}
+
 function maskTail(value) {
   const s = String(value || "");
   return s.length > 4 ? `••••${s.slice(-4)}` : s;
@@ -292,11 +359,16 @@ async function appendDetailsRow(row) {
 // A new bank account is always a new row — history of every account is retained.
 async function recordSellerBank(member, bank) {
   const rows = await getDetailsRows();
-  if (rows === null) return { ok: false };
+  if (rows === null) return { ok: false, collisions: [] };
+
+  // Computed before the early return — an account already on record for this
+  // member can still belong to someone else too.
+  const collisions = findAccountCollisions(rows, member.id,
+    { ACCOUNT: bank.account, IBAN: bank.iban });
 
   const existing = findSellerAccounts(rows, member.id)
     .find(a => a.account.replace(/\s/g, "") === bank.account.replace(/\s/g, ""));
-  if (existing) return { ok: true, added: false, known: true };
+  if (existing) return { ok: true, added: false, known: true, collisions };
 
   const row = Array(DETAILS_WIDTH).fill("");
   row[DCOL.NAME]     = member.user.username;
@@ -307,7 +379,7 @@ async function recordSellerBank(member, bank) {
   row[DCOL.ACCOUNT]  = bank.account;
   row[DCOL.IBAN]     = bank.iban;
   const res = await appendDetailsRow(row);
-  return { ok: res !== null, added: res !== null, known: false };
+  return { ok: res !== null, added: res !== null, known: false, collisions };
 }
 
 // A new Binance ID fills every empty Binance cell this person has, and is appended
@@ -329,7 +401,10 @@ function mergeMulti(currentValue, currentPartner, addValue, addPartner) {
 
 async function recordBuyerPayout(member, payout) {
   const rows = await getDetailsRows();
-  if (rows === null) return { ok: false };
+  if (rows === null) return { ok: false, collisions: [] };
+
+  const collisions = findAccountCollisions(rows, member.id,
+    { BINANCE: payout.binanceId, WALLET: payout.wallet });
 
   const mine = (rows || [])
     .map((r, i) => ({ r, rowNum: i + 2 }))
@@ -344,7 +419,7 @@ async function recordBuyerPayout(member, payout) {
     row[DCOL.ADDRESS]      = payout.wallet      || "";
     row[DCOL.NETWORK]      = payout.network     || "";
     const res = await appendDetailsRow(row);
-    return { ok: res !== null, added: res !== null, known: false };
+    return { ok: res !== null, added: res !== null, known: false, collisions };
   }
 
   // Binance ID/Name and Address/Network are two independent paired columns, so a
@@ -367,7 +442,7 @@ async function recordBuyerPayout(member, payout) {
 
   // "Known" means every account they gave us was already on record.
   const known = (!payout.binanceId || knownId) && (!payout.wallet || knownWallet);
-  if (updates.length === 0) return { ok: true, added: false, known };
+  if (updates.length === 0) return { ok: true, added: false, known, collisions };
 
   const res = await trySheet("Details Log payout update", async () => {
     const sheets = getSheets();
@@ -376,7 +451,7 @@ async function recordBuyerPayout(member, payout) {
       requestBody: { valueInputOption: "USER_ENTERED", data: updates }
     });
   });
-  return { ok: res !== null, added: res !== null, known };
+  return { ok: res !== null, added: res !== null, known, collisions };
 }
 
 // ─── VERIFIED ROLE SYNC ───────────────────────────────────────────────────────
@@ -980,6 +1055,10 @@ const commands = [
       .setDescription("View the bank/Binance details both parties submitted (staff only)")
     )
     .addSubcommand(s => s
+      .setName("audit")
+      .setDescription("Find accounts in the Details Log used by more than one member (staff only)")
+    )
+    .addSubcommand(s => s
       .setName("stats")
       .setDescription("Show DVA stats for last completed month and last 7 days")
     )
@@ -1100,6 +1179,28 @@ async function postBuyerPayout(guild, key, deal, prefix) {
 // release instruction rather than a bare acknowledgement staff would have to act
 // on separately. A correction after the block was posted re-posts it, because
 // staff must not send to a superseded address.
+// Mirror of announceBuyerPayout for the seller. If escrow is already live the
+// buyer is waiting on exactly these details, so print the block and the
+// send-funds prompt rather than a bare acknowledgement nobody can act on.
+async function announceSellerBank(guild, key, deal, note = "") {
+  const channel = dvaChannelFor(guild, key);
+  if (deal.escrowAmount && !deal.released) {
+    const sellerMember = await guild.members.fetch(deal.sellerId).catch(() => null);
+    const prefix = deal.bankPosted
+      ? `♻️ <@${deal.sellerId}> has **updated** their bank details — use the ones below.`
+      : `✅ <@${deal.sellerId}> has now submitted their bank details.`;
+    const msg = await channel.send(
+      `${prefix}\n\n${sellerBankBlock(deal, sellerMember)}\n\n` +
+      `<@${deal.buyerId}> Please send funds to <@${deal.sellerId}>`
+    );
+    trackDetailMsg(deal, msg);
+    deal.bankPosted = true;
+    saveDeal(deal, dealState[key].file);
+    return msg;
+  }
+  return channel.send(`✅ <@${deal.sellerId}> has submitted their bank details.${note}`);
+}
+
 async function announceBuyerPayout(guild, key, deal, note = "") {
   if (deal.receiptSeen) {
     const prefix = deal.payoutPosted
@@ -1210,7 +1311,7 @@ async function handleDetailInteraction(interaction) {
                `\nWrong account? Use the buttons below.`,
       components: rows2
     });
-    return dvaChannelFor(guild, key).send(`✅ <@${deal.sellerId}> has submitted their bank details.`);
+    return announceSellerBank(guild, key, deal);
   }
 
   // ── Backfill an IBAN onto an existing Details Log row ──────────────────────
@@ -1311,7 +1412,7 @@ async function handleDetailInteraction(interaction) {
     pendingBank.delete(pk);
 
     const res = await recordSellerBank(member, bank);
-    deal.sellerBank = { ...bank, knownAccount: res.known };
+    deal.sellerBank = { ...bank, knownAccount: res.known, collisions: res.collisions || [] };
     saveDeal(deal, ctx.file);
 
     await interaction.editReply({
@@ -1319,9 +1420,8 @@ async function handleDetailInteraction(interaction) {
                (res.ok ? "" : "⚠️ Could not write to the Details Log (sheet unreachable) — staff have been notified.\n") +
                "Tap the button again any time to correct them."
     });
-    return dvaChannelFor(guild, key).send(
-      `✅ <@${deal.sellerId}> has submitted their bank details.` + (res.ok ? "" : `\n⚠️ Not saved to Details Log — sheet unreachable.`)
-    );
+    return announceSellerBank(guild, key, deal,
+      res.ok ? "" : `\n⚠️ Not saved to Details Log — sheet unreachable.`);
   }
 
   // ── Buyer: choose a previously used Binance account ────────────────────────
@@ -1405,7 +1505,7 @@ async function handleDetailInteraction(interaction) {
     pendingPayout.delete(pk);
 
     const res = await recordBuyerPayout(member, payout);
-    deal.buyerPayout = { ...payout, knownAccount: res.known };
+    deal.buyerPayout = { ...payout, knownAccount: res.known, collisions: res.collisions || [] };
     saveDeal(deal, ctx.file);
 
     const what = payout.binanceId
@@ -1615,6 +1715,56 @@ client.on("interactionCreate", async interaction => {
     });
   }
 
+  // ── /dva audit ──────────────────────────────────────────────────────────────
+  // Sweeps the whole Details Log for one account held against two members.
+  // Ephemeral, masked, and capped — this is a lead for staff, not a verdict.
+  if (sub === "audit") {
+    await interaction.deferReply({ ephemeral: true });
+    const rows = await getDetailsRows();
+    if (rows === null) {
+      return interaction.editReply({ content: "❌ Could not read the Details Log. Try again shortly." });
+    }
+
+    const members = new Set();
+    const found   = [];
+    for (const { kind, label, col, multi } of COLLISION_FIELDS) {
+      const seen = new Map();                       // normalised value -> uid -> {name, rows[]}
+      rows.forEach((r, i) => {
+        const uid = String(r[DCOL.UID] || "").trim();
+        if (!uid) return;
+        members.add(uid);
+        const cells = multi ? splitMulti(r[col]) : [String(r[col] || "").trim()];
+        for (const raw of cells) {
+          if (!raw) continue;
+          const k = NORMALISE[kind](raw);
+          if (!k) continue;
+          if (!seen.has(k)) seen.set(k, { raw, users: new Map() });
+          const entry = seen.get(k).users;
+          if (!entry.has(uid)) entry.set(uid, { name: String(r[DCOL.NAME] || "").trim(), rows: [] });
+          entry.get(uid).rows.push(i + 2);
+        }
+      });
+      for (const { raw, users } of seen.values()) {
+        if (users.size > 1) found.push({ label, raw, users: [...users.entries()] });
+      }
+    }
+
+    if (found.length === 0) {
+      return interaction.editReply({
+        content: `✅ No shared accounts found across ${rows.length} rows and ${members.size} members.`
+      });
+    }
+
+    const lines = [`🔍 **Shared accounts** — ${rows.length} rows, ${members.size} members, **${found.length} found**`, ``];
+    for (const f of found.slice(0, 20)) {
+      lines.push(`**${f.label}** \`${maskTail(f.raw)}\` — ` +
+        f.users.map(([id, v]) => `${v.name || id} (row${v.rows.length > 1 ? "s" : ""} ${v.rows.join(",")})`).join("  |  "));
+    }
+    if (found.length > 20) lines.push(``, `…and ${found.length - 20} more.`);
+    lines.push(``, `_Shared accounts are not proof of wrongdoing — family members legitimately share accounts._`);
+    return interaction.editReply({ content: lines.join("\n").slice(0, 1990) });
+  }
+
   // ── /dva details ────────────────────────────────────────────────────────────
   // Staff-only view of everything both parties submitted, with a button to push
   // the buyer's payout block into the channel when the image trigger didn't fire.
@@ -1633,6 +1783,12 @@ client.on("interactionCreate", async interaction => {
     lines.push(d.buyerPayout
       ? buyerPayoutBlock(d, bMember)
       : `🏦 **<@${d.buyerId}> (Buyer) — Payout Details**\n   ⚠️ Not submitted yet.`);
+
+    const collisions = [
+      collisionNote(d.sellerBank?.collisions, d),
+      collisionNote(d.buyerPayout?.collisions, d)
+    ].filter(Boolean).join("\n");
+    if (collisions) lines.push(``, `── Shared accounts ──`, collisions);
 
     const rows = [];
     if (d.buyerPayout) {
@@ -1701,7 +1857,7 @@ client.on("interactionCreate", async interaction => {
       `${sellerBlockOrWarning(ctx.deal, sMember)}\n\n` +
       `<@${ctx.deal.buyerId}> Please send funds to <@${ctx.deal.sellerId}>`
     );
-    if (ctx.deal.sellerBank) trackDetailMsg(ctx.deal, confirmMsg);
+    if (ctx.deal.sellerBank) { trackDetailMsg(ctx.deal, confirmMsg); ctx.deal.bankPosted = true; }
     saveDeal(ctx.deal, ctx.file);
 
     let confirmReply = "✅ Escrow confirmed.";
@@ -1710,6 +1866,12 @@ client.on("interactionCreate", async interaction => {
     } else if (!isSelfRelation(ctx.deal.sellerBank.relation)) {
       confirmReply += `\nℹ️ Seller's account relation: **${ctx.deal.sellerBank.relation}** — noted in the channel.`;
     }
+    // Staff-only. Never echoed into the channel.
+    const collisions = [
+      collisionNote(ctx.deal.sellerBank?.collisions, ctx.deal),
+      collisionNote(ctx.deal.buyerPayout?.collisions, ctx.deal)
+    ].filter(Boolean).join("\n");
+    if (collisions) confirmReply += `\n\n${collisions}`;
     return interaction.reply({ content: confirmReply, ephemeral: true });
   }
 
@@ -1915,10 +2077,16 @@ client.on("messageCreate", async message => {
       if (deal.payoutNudged) { saveDeal(deal, dealState[dealKey].file); return; }
       deal.payoutNudged = true;
       saveDeal(deal, dealState[dealKey].file);
+      // The counterparty must confirm the money arrived whichever way it moved —
+      // bank transfer, CDM deposit or cash in hand — so ask for that here rather
+      // than only once payout details turn up. Staff are tagged so they know a
+      // deal is waiting even if the buyer never submits.
       return message.reply(
-        `🧾 Receipt received — thanks!\n` +
-        `⚠️ <@${deal.buyerId}> you haven't submitted your Binance details yet. ` +
-        `Tap **🏦 Buyer — Payout Details** above so staff know where to release your USDT.`
+        `🧾 Receipt received from <@${deal.buyerId}>\n\n` +
+        `<@${deal.sellerId}> — please confirm you have received the payment.\n\n` +
+        `⚠️ <@${deal.buyerId}> you haven't submitted your payout details yet. ` +
+        `Tap **🏦 Buyer — Payout Details** above so staff know where to release your crypto.\n\n` +
+        `<@${deal.staffId}> — this deal is waiting on payout details.`
       ).catch(() => {});
     }
 
