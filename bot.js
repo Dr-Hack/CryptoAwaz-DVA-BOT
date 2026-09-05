@@ -1,6 +1,6 @@
 // DVA Bot - bot.js
-// Version: 1.37
-// Last Modified: 2026-09-04
+// Version: 2.0
+// Last Modified: 2026-09-05
 // Dependencies: discord.js@14, googleapis, dotenv, node-cron
 // Install: npm install discord.js googleapis dotenv node-cron
 
@@ -16,24 +16,32 @@ const cron = require("node-cron");
 
 // ─── STAFF CONFIG ─────────────────────────────────────────────────────────────
 // Replace STAFF_X_DISCORD_ID with actual Discord User IDs
+//
+// `message` and `addresses` are deliberately separate. The SOP text posts at
+// /dva start; the deposit addresses are held back until both parties have
+// submitted their details, so submitting is what unlocks the deal instead of
+// staff chasing people once crypto is already in flight. See revealAddresses().
 const STAFF = {
   "377834469656100865": {
     name: "Niazai",
     colIndex: 1, // logs to Column B in Fund Log
     binanceId: "11905680",
-    message: "Please share deal details and proceed as per SOP.\nAll deal related talk to be done in this chat, including sharing of Bank information, which is deleted on termination of a deal. Share screenshot after making any payment.\n\n**Binance ID:** `11905680`"
+    message: "Please share deal details and proceed as per SOP.\nAll deal related talk to be done in this chat, including sharing of Bank information, which is deleted on termination of a deal. Share screenshot after making any payment.",
+    addresses: "**Binance ID:** `11905680`"
   },
   "814816806895091752": {
     name: "Nomy",
     colIndex: 2, // logs to Column C
     binanceId: "75096450",
-    message: "Please share the deal details and proceed according to the DVA SOP. Both of you are advised to use personal accounts for sending and receiving PKR to avoid future banking issues. Share all transaction-related details, including bank screenshots and receipts, in this chat. Bank information will be deleted once the deal is completed.\n\n**Binance ID:** `75096450`\n**TRC-20 USDT:** `TVWmhTBdZb5ech2Rx3vfXEwdzT6D3gzuuA`\n**BEP-20 USDT:** `0xf8387123c01a5e1a18c73cd550cba3763d6dc3f3`"
+    message: "Please share the deal details and proceed according to the DVA SOP. Both of you are advised to use personal accounts for sending and receiving PKR to avoid future banking issues. Share all transaction-related details, including bank screenshots and receipts, in this chat. Bank information will be deleted once the deal is completed.",
+    addresses: "**Binance ID:** `75096450`\n**TRC-20 USDT:** `TVWmhTBdZb5ech2Rx3vfXEwdzT6D3gzuuA`\n**BEP-20 USDT:** `0xf8387123c01a5e1a18c73cd550cba3763d6dc3f3`"
   },
   "349465216209387530": {
     name: "SilentKiller",
     colIndex: 3, // logs to Column D
     binanceId: "35798024",
-    message: "Please share deal details and proceed as per SOP.\nAll deal related talk to be done in this chat, including sharing of Bank information, which is deleted on termination of a deal.\n\n**Binance ID:** `35798024` | **Username:** SilentKiller4233\n**SOL BINANCE USDC/USDT:**\n`41poDbaaHWPd3GCHNXZz8XroNy9xzLeYYtqjFTCMya7X`\n**ETH/BEP20 BINANCE USDC/USDT:**\n`0xe50376a8566f348c17aa10e83182ac7e7f44ebe3`\n**TRC20 BINANCE USDT:**\n`TQ1VrZNo7zj8RvPg8RjXwyS2UcsWgv6ENV`"
+    message: "Please share deal details and proceed as per SOP.\nAll deal related talk to be done in this chat, including sharing of Bank information, which is deleted on termination of a deal.",
+    addresses: "**Binance ID:** `35798024` | **Username:** SilentKiller4233\n**SOL BINANCE USDC/USDT:**\n`41poDbaaHWPd3GCHNXZz8XroNy9xzLeYYtqjFTCMya7X`\n**ETH/BEP20 BINANCE USDC/USDT:**\n`0xe50376a8566f348c17aa10e83182ac7e7f44ebe3`\n**TRC20 BINANCE USDT:**\n`TQ1VrZNo7zj8RvPg8RjXwyS2UcsWgv6ENV`"
   }
 };
 
@@ -1180,6 +1188,80 @@ async function postBuyerPayout(guild, key, deal, prefix) {
   return msg;
 }
 
+// ─── ADDRESS GATE ─────────────────────────────────────────────────────────────
+// The staff deposit addresses are held back until both parties have submitted.
+// The delay is real but it sits at the start of the deal, before anyone has
+// moved funds — which is far cheaper than the same delay after the seller has
+// sent crypto and staff are chasing a buyer for a Binance ID. It is also
+// self-correcting: every gated deal writes a payout row, so the reuse buttons
+// cover more people each time and the gate stops being felt.
+function bothPartiesSubmitted(deal) {
+  return Boolean(deal.sellerBank && deal.buyerPayout);
+}
+
+// Who the deal is still waiting on, or null when nothing is outstanding.
+function awaitingParty(deal) {
+  if (!deal.sellerBank && !deal.buyerPayout) return "both";
+  if (!deal.sellerBank) return "seller";
+  if (!deal.buyerPayout) return "buyer";
+  return null;
+}
+
+// One line appended to a submission acknowledgement, naming who is holding
+// things up. Silent once the addresses are out, so it never nags after the fact.
+function gateNote(deal) {
+  if (deal.addressesPosted) return "";
+  const waiting = awaitingParty(deal);
+  if (waiting === "seller") return `\n⏳ Waiting on <@${deal.sellerId}> — the deposit address posts once both of you have submitted.`;
+  if (waiting === "buyer")  return `\n⏳ Waiting on <@${deal.buyerId}> — the deposit address posts once both of you have submitted.`;
+  return "";
+}
+
+// Posts the staff deposit addresses and tells the seller to send. `overrideBy`
+// is set when staff released early via the button, so the channel can see the
+// addresses went out with details still missing.
+async function revealAddresses(guild, key, deal, overrideBy = null) {
+  if (deal.addressesPosted) return null;
+  const staff = STAFF[deal.staffId];
+  if (!staff?.addresses) return null;
+
+  const waiting = awaitingParty(deal);
+  const outstanding = waiting === "both"
+    ? `<@${deal.sellerId}> and <@${deal.buyerId}> have not submitted their details yet`
+    : waiting === "seller" ? `<@${deal.sellerId}> has not submitted bank details yet`
+    : waiting === "buyer"  ? `<@${deal.buyerId}> has not submitted payout details yet` : null;
+
+  const header = (overrideBy && outstanding)
+    ? `🔓 <@${overrideBy}> has released the deposit address early — ${outstanding}.`
+    : `✅ Both parties have submitted their details.`;
+
+  const msg = await dvaChannelFor(guild, key).send(
+    `${header}\n\n<@${deal.sellerId}> — please send your crypto asset to:\n\n${staff.addresses}\n\n` +
+    `📸 Please share screenshot once you have transferred crypto asset.`
+  );
+  deal.addressesPosted = true;
+  saveDeal(deal, dealState[key].file);
+  return msg;
+}
+
+// Called at the tail of both submission paths. Whichever party submits second
+// is the one that trips it.
+async function maybeRevealAddresses(guild, key, deal) {
+  if (!bothPartiesSubmitted(deal)) return null;
+  return revealAddresses(guild, key, deal);
+}
+
+// True when this submission is the one about to open the gate. The address block
+// opens by announcing both parties are in, so the submitter's own bare
+// acknowledgement immediately before it would only say the same thing twice.
+// Checks the staff address exists, or suppressing the acknowledgement would
+// leave the channel with nothing at all.
+function gateWillOpen(deal) {
+  return bothPartiesSubmitted(deal)
+      && !deal.addressesPosted
+      && Boolean(STAFF[deal.staffId]?.addresses);
+}
+
 // What the channel sees when the buyer submits payout details. If their receipt
 // already arrived, the deal is waiting on nothing else — so go straight to the
 // release instruction rather than a bare acknowledgement staff would have to act
@@ -1202,9 +1284,15 @@ async function announceSellerBank(guild, key, deal, note = "") {
     trackDetailMsg(deal, msg);
     deal.bankPosted = true;
     saveDeal(deal, dealState[key].file);
+    await maybeRevealAddresses(guild, key, deal);
     return msg;
   }
-  return channel.send(`✅ <@${deal.sellerId}> has submitted their bank details.${note}`);
+  // Skipped when the address block is about to say the same thing — but a sheet
+  // warning is never swallowed by that tidy-up, it has to be seen.
+  const ack = (!gateWillOpen(deal) || note)
+    ? await channel.send(`✅ <@${deal.sellerId}> has submitted their bank details.${note}${gateNote(deal)}`)
+    : null;
+  return (await maybeRevealAddresses(guild, key, deal)) || ack;
 }
 
 async function announceBuyerPayout(guild, key, deal, note = "") {
@@ -1212,10 +1300,17 @@ async function announceBuyerPayout(guild, key, deal, note = "") {
     const prefix = deal.payoutPosted
       ? `♻️ <@${deal.buyerId}> has **updated** their payout details — use the ones below.`
       : `✅ <@${deal.buyerId}> has now submitted their payout details.`;
-    return postBuyerPayout(guild, key, deal, prefix);
+    const msg = await postBuyerPayout(guild, key, deal, prefix);
+    await maybeRevealAddresses(guild, key, deal);
+    return msg;
   }
-  return dvaChannelFor(guild, key).send(
-    `✅ <@${deal.buyerId}> has submitted their payout details.${note}`);
+  // Same as the seller path — the address block announces the pair is complete,
+  // so this acknowledgement stands down unless it is carrying a warning.
+  const ack = (!gateWillOpen(deal) || note)
+    ? await dvaChannelFor(guild, key).send(
+        `✅ <@${deal.buyerId}> has submitted their payout details.${note}${gateNote(deal)}`)
+    : null;
+  return (await maybeRevealAddresses(guild, key, deal)) || ack;
 }
 
 // ─── DETAIL COLLECTION — INTERACTION ROUTER ───────────────────────────────────
@@ -1246,6 +1341,21 @@ async function handleDetailInteraction(interaction) {
     await interaction.deferReply({ ephemeral: true });
     await postBuyerPayout(guild, key, deal, `💰 Payment confirmed by <@${interaction.user.id}>`);
     return interaction.editReply({ content: "✅ Payout details posted in the channel." });
+  }
+
+  // ── Staff-only: release the deposit address before both parties submitted ──
+  if (action === "reveal") {
+    if (!STAFF[interaction.user.id]) {
+      return interaction.reply({ content: "❌ Staff only.", ephemeral: true });
+    }
+    if (deal.addressesPosted) {
+      return interaction.reply({ content: "ℹ️ The deposit address is already posted in the channel.", ephemeral: true });
+    }
+    await interaction.deferReply({ ephemeral: true });
+    const posted = await revealAddresses(guild, key, deal, interaction.user.id);
+    return interaction.editReply({ content: posted
+      ? "✅ Deposit address posted. The missing details are still worth collecting before release."
+      : "❌ No deposit address is configured for the staff member who started this deal." });
   }
 
   // ── Everything else is locked to the party it belongs to ───────────────────
@@ -1514,9 +1624,13 @@ async function handleDetailInteraction(interaction) {
     deal.buyerPayout = { ...payout, knownAccount: res.known, collisions: res.collisions || [] };
     saveDeal(deal, ctx.file);
 
-    const what = payout.binanceId
-      ? `Binance ID \`${payout.binanceId}\`${payout.wallet ? ` and wallet \`${payout.wallet}\`` : ``}`
-      : `wallet \`${payout.wallet}\` on **${payout.network}**`;
+    // Built from whichever fields were given, so a wallet always carries its
+    // network — that is the one detail the buyer must be able to check here,
+    // since the wrong chain loses the funds. validatePayout guarantees it exists.
+    const what = [
+      payout.binanceId ? `Binance ID \`${payout.binanceId}\`` : ``,
+      payout.wallet    ? `wallet \`${payout.wallet}\` on **${payout.network}**` : ``
+    ].filter(Boolean).join(" and ");
     await interaction.editReply({
       content: `✅ Payout details recorded — ${what}.\n` +
                (res.ok ? "" : "⚠️ Could not write to the Details Log (sheet unreachable) — staff have been notified.\n") +
@@ -1646,6 +1760,7 @@ client.on("interactionCreate", async interaction => {
       sellerBank:   null,
       buyerPayout:  null,
       payoutPosted: false,
+      addressesPosted: false,
       payoutNudged: false,
       receiptSeen:  false,
       detailMsgIds: []
@@ -1673,6 +1788,8 @@ client.on("interactionCreate", async interaction => {
         ((sellerSaved || buyerSaved)
           ? `\n*Green = reuse an account you've used before. Grey = enter a different one.*`
           : ``) +
+        `\n\n⏳ The deposit address is posted once **both** of you have submitted — ` +
+        `that way nothing stalls later while funds are already moving.` +
         (detailRows === null ? `\n⚠️ Details Log is unreachable right now — entries may not be saved.` : ``),
       components: detailButtonRows(key, ctx.deal.dealToken, sellerSaved, buyerSaved)
     });
@@ -1796,13 +1913,32 @@ client.on("interactionCreate", async interaction => {
     ].filter(Boolean).join("\n");
     if (collisions) lines.push(``, `── Shared accounts ──`, collisions);
 
-    const rows = [];
+    // The gate holds the deposit address until both sides are in. Show staff who
+    // it is waiting on, and give them a way out when a party genuinely can't
+    // submit — otherwise one absent trader stalls a live deal.
+    const waiting = awaitingParty(d);
+    if (!d.addressesPosted && waiting) {
+      lines.push(``, waiting === "both"
+        ? `⏳ **Deposit address held** — neither party has submitted yet.`
+        : `⏳ **Deposit address held** — waiting on <@${waiting === "seller" ? d.sellerId : d.buyerId}>.`);
+    } else if (d.addressesPosted) {
+      lines.push(``, `🔓 Deposit address has been posted.`);
+    }
+
+    const buttons = [];
     if (d.buyerPayout) {
-      rows.push(new ActionRowBuilder().addComponents(new ButtonBuilder()
+      buttons.push(new ButtonBuilder()
         .setCustomId(cid("postpayout", key, d.dealToken))
         .setLabel(d.payoutPosted ? "📤 Post Payout Again" : "📤 Post Payout to Channel")
-        .setStyle(ButtonStyle.Primary)));
+        .setStyle(ButtonStyle.Primary));
     }
+    if (!d.addressesPosted && STAFF[d.staffId]?.addresses) {
+      buttons.push(new ButtonBuilder()
+        .setCustomId(cid("reveal", key, d.dealToken))
+        .setLabel("🔓 Reveal Address Anyway")
+        .setStyle(ButtonStyle.Secondary));
+    }
+    const rows = buttons.length ? [new ActionRowBuilder().addComponents(...buttons)] : [];
     return interaction.reply({ content: lines.join("\n"), components: rows, ephemeral: true });
   }
 
@@ -2082,18 +2218,23 @@ client.on("messageCreate", async message => {
     if (!deal.buyerPayout) {
       if (deal.payoutNudged) { saveDeal(deal, dealState[dealKey].file); return; }
       deal.payoutNudged = true;
-      saveDeal(deal, dealState[dealKey].file);
       // The counterparty must confirm the money arrived whichever way it moved —
       // bank transfer, CDM deposit or cash in hand — so ask for that here rather
       // than only once payout details turn up. Staff are tagged so they know a
       // deal is waiting even if the buyer never submits.
-      return message.reply(
+      const nudge = await message.reply(
         `🧾 Receipt received from <@${deal.buyerId}>\n\n` +
         `<@${deal.sellerId}> — please confirm you have received the payment.\n\n` +
         `⚠️ <@${deal.buyerId}> you haven't submitted your payout details yet. ` +
         `Tap **🏦 Buyer — Payout Details** above so staff know where to release your crypto.\n\n` +
         `<@${deal.staffId}> — this deal is waiting on payout details.`
-      ).catch(() => {});
+      ).catch(() => null);
+      // Chased-for-details chatter is meaningless once the deal is over, so it
+      // goes with the rest of the sweep. Tracked before the save, or a restart
+      // between the two would strand the message in the channel forever.
+      trackDetailMsg(deal, nudge);
+      saveDeal(deal, dealState[dealKey].file);
+      return;
     }
 
     return postBuyerPayout(message.guild, dealKey, deal, `🧾 Receipt received from <@${deal.buyerId}>`)
