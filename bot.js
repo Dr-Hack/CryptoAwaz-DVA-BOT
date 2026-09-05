@@ -1,6 +1,6 @@
 // DVA Bot - bot.js
-// Version: 1.36
-// Last Modified: 2026-08-31
+// Version: 1.37
+// Last Modified: 2026-09-04
 // Dependencies: discord.js@14, googleapis, dotenv, node-cron
 // Install: npm install discord.js googleapis dotenv node-cron
 
@@ -344,13 +344,19 @@ function maskTail(value) {
 }
 
 // ─── DETAILS LOG — WRITE ──────────────────────────────────────────────────────
+// Every Details Log write uses valueInputOption "RAW", never "USER_ENTERED".
+// USER_ENTERED parses the value as if a person had typed it, so an Easypaisa
+// number like 03006911565 is read as a number and stored as 3006911565 — the
+// leading zero is silently destroyed, and the account is then unusable. RAW
+// stores the string exactly as given. The one exception is the Verified column,
+// which writes a boolean and does want parsing so the checkbox ticks.
 async function appendDetailsRow(row) {
   return trySheet("Details Log append", async () => {
     const sheets = getSheets();
     return sheets.spreadsheets.values.append({
       spreadsheetId: SHEET_ID,
       range: `${DETAILS_TAB}!A:N`,
-      valueInputOption: "USER_ENTERED",
+      valueInputOption: "RAW",
       requestBody: { values: [row] }
     });
   });
@@ -448,7 +454,7 @@ async function recordBuyerPayout(member, payout) {
     const sheets = getSheets();
     return sheets.spreadsheets.values.batchUpdate({
       spreadsheetId: SHEET_ID,
-      requestBody: { valueInputOption: "USER_ENTERED", data: updates }
+      requestBody: { valueInputOption: "RAW", data: updates }
     });
   });
   return { ok: res !== null, added: res !== null, known, collisions };
@@ -1343,7 +1349,7 @@ async function handleDetailInteraction(interaction) {
         getSheets().spreadsheets.values.update({
           spreadsheetId: SHEET_ID,
           range: `${DETAILS_TAB}!H${deal.sellerBank.rowNum}`,
-          valueInputOption: "USER_ENTERED",
+          valueInputOption: "RAW",
           requestBody: { values: [[iban]] }
         }));
       if (res === null) warn = `\n⚠️ Saved for this deal, but the sheet could not be updated.`;
