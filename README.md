@@ -14,6 +14,7 @@
 - **Full escrow workflow** — start, confirm, release, close, or cancel deals via slash commands
 - **Party detail collection** — buyer and seller submit Binance and bank details through private modals; the bot posts each to the other party at the right moment and deletes them on close
 - **Address gate** — the staff deposit address is held back until *both* parties have submitted, so the deal never stalls halfway through with funds already moving
+- **Amount stated at release** — the payout block names the exact escrow figure, so staff never scroll back to `/dva confirm` for the number
 - **Account registry** — every account used is logged to the `Details Log` tab for scam cross-referencing; returning traders pick a saved account instead of retyping
 - **Shared-account audit** — `/dva audit` finds accounts used by more than one member across the whole registry
 - **Cash deals** — a parallel `#dva-cash` slot for bank-deposit and face-to-face trades, running independently of the normal slot
@@ -65,9 +66,11 @@ Details are then surfaced automatically:
 
 | Moment | What the bot posts |
 |---|---|
-| **Both parties have submitted** | The staff deposit address, and `@seller — please send your crypto asset to:` |
-| `/dva confirm` | Seller's receiving account, with a ⚠️ warning if the relation isn't `Self` |
-| Buyer uploads a receipt image | Prompts the seller to confirm payment, then shows the buyer's payout details |
+| One party has submitted | A line naming them, and a tagged reminder of who is still outstanding |
+| That party submits **again** | `♻️ … has updated their …` — different wording, and no ping, so an edit doesn't nag the other party a second time |
+| **Both parties have submitted** | The staff deposit address, `@seller — please send your crypto asset to:`, and a request for a screenshot once sent |
+| `/dva confirm` | Seller's receiving account, with the relation stated if it isn't `Self` |
+| Buyer uploads a receipt image | Prompts the seller to confirm payment, then shows the buyer's payout details **and the exact amount to release** |
 | `/dva close` / `/dva cancel` | Deletes every message it posted containing account details |
 
 Each block carries a two-part badge: **verified status** comes from the Discord `VERIFIED` role
@@ -91,6 +94,20 @@ can't submit, and the channel is told plainly that the address went out with det
 
 Nothing else is ever blocked. If a party hasn't submitted, the bot says so publicly and warns staff
 ephemerally, and the deal proceeds so details can be collected by hand.
+
+#### No dead ends
+
+Every panel a party can open has a way back out, because one that doesn't will strand somebody
+mid-deal:
+
+| Panel | Escape |
+|---|---|
+| Seller's Bank ▾ / Relation ▾ step | **↩️ Use a Saved Account** when they have one on file, otherwise **✕ Cancel** |
+| Buyer's rejected payout form | **↩️ Reopen Form**, **🏦 Use a Saved Account**, or **✕ Cancel** |
+| Pressing Continue with nothing picked | Names which dropdown is missing and points at the button beside Continue |
+
+Cancel is handled *above* the party lock, since either side can press it and it only ever touches the
+presser's own draft — routing it below would have rejected the seller as "this is for @buyer only".
 
 > ⚠️ The receipt-image trigger requires **Message Content Intent** to be enabled under
 > Bot → Privileged Gateway Intents in the Discord Developer Portal. Everything else works without it;

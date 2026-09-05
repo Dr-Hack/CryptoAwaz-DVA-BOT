@@ -1,6 +1,6 @@
 // DVA Bot - bot.js
-// Version: 2.0
-// Last Modified: 2026-09-05
+// Version: 2.1
+// Last Modified: 2026-09-06
 // Dependencies: discord.js@14, googleapis, dotenv, node-cron
 // Install: npm install discord.js googleapis dotenv node-cron
 
@@ -975,10 +975,15 @@ function sellerBankBlock(deal, sellerMember) {
 
 function buyerPayoutBlock(deal, buyerMember) {
   const p = deal.buyerPayout;
+  // State the amount here, not just up at /dva confirm. By the time this posts,
+  // the confirm message can be a long scroll away, and re-reading the wrong
+  // number is the expensive kind of mistake. Falls back to "Crypto" before
+  // escrow is set — /dva details can print this block ahead of /dva confirm.
+  const amount = deal.escrowAmount ? `${deal.escrowAmount} USDT` : `Crypto`;
   const lines = [
     // Tagged so the staff member running the deal gets a ping to come back to it.
     // "Crypto" rather than "USDT" — almost always USDT, but not guaranteed.
-    `🏦 **Once confirmed, <@${deal.staffId}> please release Crypto to <@${deal.buyerId}>:**`
+    `🏦 **Once confirmed, <@${deal.staffId}> please release ${amount} to <@${deal.buyerId}>:**`
   ];
   // A wallet-only buyer has no Binance ID, so print only what was actually given.
   if (p.binanceId)   lines.push(`   Binance ID:   \`${p.binanceId}\``);
@@ -1207,6 +1212,30 @@ function awaitingParty(deal) {
   return null;
 }
 
+// What the channel sees when a party submits. A second submission from the same
+// party — correcting a typo, adding a wallet alongside a Binance ID — must not
+// repeat the first message word for word, or the channel looks stuck. It reads
+// as an update instead, and the counterparty is named without being pinged
+// again: they were already told, and a second ping for someone else's edit is
+// just noise. Returns a payload, since suppressing the ping needs allowedMentions.
+function submissionAck(deal, side, note = "") {
+  const isSeller = side === "seller";
+  const who      = isSeller ? deal.sellerId : deal.buyerId;
+  const what     = isSeller ? "bank details" : "payout details";
+  const repeat   = isSeller ? deal.sellerAcked : deal.buyerAcked;
+
+  // No block follows this message — the details are still held back — so it must
+  // not point at details "below". The escrow and receipt branches do print a
+  // block, and they carry their own "use the ones below" wording.
+  const content = repeat
+    ? `♻️ <@${who}> has **updated** their ${what}.${note}${gateNote(deal)}`
+    : `✅ <@${who}> has submitted their ${what}.${note}${gateNote(deal)}`;
+
+  // A first submission should ping whoever is still being waited on. An update
+  // should not — nothing new is being asked of them.
+  return repeat ? { content, allowedMentions: { parse: [] } } : { content };
+}
+
 // One line appended to a submission acknowledgement, naming who is holding
 // things up. Silent once the addresses are out, so it never nags after the fact.
 function gateNote(deal) {
@@ -1290,8 +1319,10 @@ async function announceSellerBank(guild, key, deal, note = "") {
   // Skipped when the address block is about to say the same thing — but a sheet
   // warning is never swallowed by that tidy-up, it has to be seen.
   const ack = (!gateWillOpen(deal) || note)
-    ? await channel.send(`✅ <@${deal.sellerId}> has submitted their bank details.${note}${gateNote(deal)}`)
+    ? await channel.send(submissionAck(deal, "seller", note))
     : null;
+  deal.sellerAcked = true;
+  saveDeal(deal, dealState[key].file);
   return (await maybeRevealAddresses(guild, key, deal)) || ack;
 }
 
@@ -1307,9 +1338,10 @@ async function announceBuyerPayout(guild, key, deal, note = "") {
   // Same as the seller path — the address block announces the pair is complete,
   // so this acknowledgement stands down unless it is carrying a warning.
   const ack = (!gateWillOpen(deal) || note)
-    ? await dvaChannelFor(guild, key).send(
-        `✅ <@${deal.buyerId}> has submitted their payout details.${note}${gateNote(deal)}`)
+    ? await dvaChannelFor(guild, key).send(submissionAck(deal, "buyer", note))
     : null;
+  deal.buyerAcked = true;
+  saveDeal(deal, dealState[key].file);
   return (await maybeRevealAddresses(guild, key, deal)) || ack;
 }
 
@@ -1356,6 +1388,19 @@ async function handleDetailInteraction(interaction) {
     return interaction.editReply({ content: posted
       ? "✅ Deposit address posted. The missing details are still worth collecting before release."
       : "❌ No deposit address is configured for the staff member who started this deal." });
+  }
+
+  // ── Closing a panel opened by mistake ──────────────────────────────────────
+  // Handled before the party lock, because either side can press it and the
+  // action only ever touches the presser's own pending draft and ephemeral.
+  if (action === "detailcancel") {
+    const own = pKey(key, interaction.user.id);
+    pendingBank.delete(own);
+    pendingPayout.delete(own);
+    return interaction.update({
+      content: "Cancelled — nothing was submitted. Tap a button in the channel whenever you're ready.",
+      components: []
+    });
   }
 
   // ── Everything else is locked to the party it belongs to ───────────────────
@@ -1476,6 +1521,16 @@ async function handleDetailInteraction(interaction) {
       return interaction.showModal(sellerModal(key, token, true));
     }
     pendingBank.set(pk, { bank: null, relation: null });
+    // This panel is not a modal, so Discord gives it no dismiss of its own. Without
+    // a way back, someone who opened it by mistake — or who already has an account
+    // on file — is stranded on an error message. Offer the way out they'd expect:
+    // back to their saved accounts if they have any, otherwise a plain cancel.
+    const hasSaved = deal.sellerSaved || Boolean(deal.sellerBank);
+    const escape   = hasSaved
+      ? new ButtonBuilder().setCustomId(cid("sellerpick", key, token))
+          .setLabel("↩️ Use a Saved Account").setStyle(ButtonStyle.Secondary)
+      : new ButtonBuilder().setCustomId(cid("detailcancel", key, token))
+          .setLabel("✕ Cancel").setStyle(ButtonStyle.Secondary);
     return interaction.reply({
       ephemeral: true,
       content: "Step 1 of 2 — pick your bank and your relation to the account, then press Continue.",
@@ -1486,11 +1541,14 @@ async function handleDetailInteraction(interaction) {
         new ActionRowBuilder().addComponents(new StringSelectMenuBuilder()
           .setCustomId(cid("relpick", key, token)).setPlaceholder("Relation with account")
           .addOptions(relationSelectOptions())),
-        new ActionRowBuilder().addComponents(new ButtonBuilder()
-          .setCustomId(cid("sellercont", key, token)).setLabel("Continue →").setStyle(ButtonStyle.Primary))
+        new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId(cid("sellercont", key, token))
+            .setLabel("Continue →").setStyle(ButtonStyle.Primary),
+          escape)
       ]
     });
   }
+
 
   if (action === "bankpick" || action === "relpick") {
     const p = pendingBank.get(pk) || { bank: null, relation: null };
@@ -1503,7 +1561,15 @@ async function handleDetailInteraction(interaction) {
   if (action === "sellercont") {
     const p = pendingBank.get(pk);
     if (!p?.bank || !p?.relation) {
-      return interaction.reply({ content: "❌ Please choose both a bank and a relation first.", ephemeral: true });
+      // Name what's missing rather than both, so the fix is obvious at a glance.
+      const missing = !p?.bank && !p?.relation ? "a **bank** and a **relation**"
+                    : !p?.bank                 ? "a **bank**"
+                    :                            "a **relation**";
+      return interaction.reply({
+        content: `❌ Pick ${missing} from the dropdowns above, then press Continue.\n` +
+                 `Opened this by mistake? Use the button beside Continue to go back.`,
+        ephemeral: true
+      });
     }
     // The account number is always typed fresh, so a different account can never
     // inherit the previous one's digits.
@@ -1612,10 +1678,19 @@ async function handleDetailInteraction(interaction) {
     const problems = validatePayout(payout);
     if (problems.length) {
       pendingPayout.set(pk, payout);
+      // A rejected form must not be a dead end either: reopen to finish, go back
+      // to an account already on file, or walk away without submitting anything.
+      const row = new ActionRowBuilder().addComponents(new ButtonBuilder()
+        .setCustomId(cid("buyernew", key, token)).setLabel("↩️ Reopen Form").setStyle(ButtonStyle.Primary));
+      if (deal.buyerSaved || deal.buyerPayout) {
+        row.addComponents(new ButtonBuilder().setCustomId(cid("buyerpick", key, token))
+          .setLabel("🏦 Use a Saved Account").setStyle(ButtonStyle.Secondary));
+      }
+      row.addComponents(new ButtonBuilder().setCustomId(cid("detailcancel", key, token))
+        .setLabel("✕ Cancel").setStyle(ButtonStyle.Secondary));
       return interaction.editReply({
         content: `❌ Not saved yet:\n${problems.map(p => `• ${p}`).join("\n")}\n\nYour answers are kept — reopen the form to finish.`,
-        components: [new ActionRowBuilder().addComponents(new ButtonBuilder()
-          .setCustomId(cid("buyernew", key, token)).setLabel("↩️ Reopen Form").setStyle(ButtonStyle.Primary))]
+        components: [row]
       });
     }
     pendingPayout.delete(pk);
@@ -1760,7 +1835,17 @@ client.on("interactionCreate", async interaction => {
       sellerBank:   null,
       buyerPayout:  null,
       payoutPosted: false,
+      bankPosted:   false,
       addressesPosted: false,
+      // Whether each party already had accounts on file when the deal opened.
+      // Decides whether a mistaken panel offers "use a saved account" or "cancel",
+      // without a sheet round-trip every time someone taps a button.
+      sellerSaved:  false,
+      buyerSaved:   false,
+      // Set once each party has been announced, so a second submission reads as
+      // an update rather than repeating the first message word for word.
+      sellerAcked:  false,
+      buyerAcked:   false,
       payoutNudged: false,
       receiptSeen:  false,
       detailMsgIds: []
@@ -1779,6 +1864,9 @@ client.on("interactionCreate", async interaction => {
     const detailRows  = await getDetailsRows();
     const sellerSaved = detailRows ? findSellerAccounts(detailRows, seller.id).length > 0 : false;
     const buyerSaved  = detailRows ? findBuyerAccounts(detailRows, buyer.id).length  > 0 : false;
+    ctx.deal.sellerSaved = sellerSaved;
+    ctx.deal.buyerSaved  = buyerSaved;
+    saveDeal(ctx.deal, ctx.file);
 
     await dvaChannel.send({
       content:
