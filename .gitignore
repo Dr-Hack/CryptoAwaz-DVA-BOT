@@ -2,8 +2,15 @@
 .env
 credentials.json
 
-# Runtime state
+# Runtime state — the deal files hold live bank details, IBANs and Binance IDs,
+# so they must never reach the repo. These only exist on the machine running the
+# bot; listing all three keeps a stray `git add .` there from committing them.
 active_deal.json
+active_cash_deal.json
+discount_campaign.json
+
+# Editor
+DVA Bot.code-workspace
 
 # Dependencies
 node_modules/
