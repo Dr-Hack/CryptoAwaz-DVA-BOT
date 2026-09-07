@@ -1,6 +1,6 @@
 // DVA Bot - bot.js
-// Version: 2.1
-// Last Modified: 2026-09-06
+// Version: 2.2
+// Last Modified: 2026-09-07
 // Dependencies: discord.js@14, googleapis, dotenv, node-cron
 // Install: npm install discord.js googleapis dotenv node-cron
 
@@ -34,7 +34,7 @@ const STAFF = {
     colIndex: 2, // logs to Column C
     binanceId: "75096450",
     message: "Please share the deal details and proceed according to the DVA SOP. Both of you are advised to use personal accounts for sending and receiving PKR to avoid future banking issues. Share all transaction-related details, including bank screenshots and receipts, in this chat. Bank information will be deleted once the deal is completed.",
-    addresses: "**Binance ID:** `75096450`\n**TRC-20 USDT:** `TVWmhTBdZb5ech2Rx3vfXEwdzT6D3gzuuA`\n**BEP-20 USDT:** `0xf8387123c01a5e1a18c73cd550cba3763d6dc3f3`"
+    addresses: "**Binance ID:** `75096450`\n**TRC-20 USDT:** `TVWmhTBdZb5ech2Rx3vfXEwdzT6D3gzuuA`\n**BEP-20 USDT:** `0xf8387123c01a5e1a18c73cd550cba3763d6dc3f3`\n**SOL USDT/USDC:** `3EpiaKtzRXaLeyNSWiSEF8FrZmR811sZH7iw71NxwN1f`"
   },
   "349465216209387530": {
     name: "SilentKiller",
@@ -1291,6 +1291,15 @@ function gateWillOpen(deal) {
       && Boolean(STAFF[deal.staffId]?.addresses);
 }
 
+// The buyer's PKR transfer is the one leg the bot never sees for itself. A
+// receipt that doesn't name both sides can't be matched against the account the
+// seller registered, so the ask rides along with the transfer instruction rather
+// than arriving after the money has already moved.
+function sendFundsPrompt(deal) {
+  return `<@${deal.buyerId}> Please send funds to <@${deal.sellerId}>\n` +
+         `📸 Please send screenshot of receipt showing **sender and receiver name**.`;
+}
+
 // What the channel sees when the buyer submits payout details. If their receipt
 // already arrived, the deal is waiting on nothing else — so go straight to the
 // release instruction rather than a bare acknowledgement staff would have to act
@@ -1308,7 +1317,7 @@ async function announceSellerBank(guild, key, deal, note = "") {
       : `✅ <@${deal.sellerId}> has now submitted their bank details.`;
     const msg = await channel.send(
       `${prefix}\n\n${sellerBankBlock(deal, sellerMember)}\n\n` +
-      `<@${deal.buyerId}> Please send funds to <@${deal.sellerId}>`
+      sendFundsPrompt(deal)
     );
     trackDetailMsg(deal, msg);
     deal.bankPosted = true;
@@ -2085,7 +2094,7 @@ client.on("interactionCreate", async interaction => {
       `✅ ${amount} USDT received\n` +
       `🔒 ${ctx.deal.escrowAmount} USDT escrow${note}\n\n` +
       `${sellerBlockOrWarning(ctx.deal, sMember)}\n\n` +
-      `<@${ctx.deal.buyerId}> Please send funds to <@${ctx.deal.sellerId}>`
+      sendFundsPrompt(ctx.deal)
     );
     if (ctx.deal.sellerBank) { trackDetailMsg(ctx.deal, confirmMsg); ctx.deal.bankPosted = true; }
     saveDeal(ctx.deal, ctx.file);
@@ -2135,7 +2144,7 @@ client.on("interactionCreate", async interaction => {
       `✅ ${amountDisplay} USDT received\n` +
       `🔒 ${ctx.deal.escrowAmount} USDT escrow\n\n` +
       `${sellerBlockOrWarning(ctx.deal, guild.members.cache.get(ctx.deal.sellerId))}\n\n` +
-      `<@${ctx.deal.buyerId}> Please send funds to <@${ctx.deal.sellerId}>`
+      sendFundsPrompt(ctx.deal)
     );
     if (ctx.deal.sellerBank) trackDetailMsg(ctx.deal, updateMsg);
     saveDeal(ctx.deal, ctx.file);
