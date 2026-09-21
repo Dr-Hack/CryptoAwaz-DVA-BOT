@@ -1,6 +1,6 @@
 // DVA Bot - bot.js
-// Version: 2.2
-// Last Modified: 2026-09-07
+// Version: 2.3
+// Last Modified: 2026-09-21
 // Dependencies: discord.js@14, googleapis, dotenv, node-cron
 // Install: npm install discord.js googleapis dotenv node-cron
 
@@ -346,6 +346,15 @@ function collisionNote(collisions, deal) {
   return lines.join("\n");
 }
 
+// Staff-facing, like collisionNote — a changed ID may have an innocent reason,
+// so it is never posted where the counterparty can read it.
+function idChangeNote(deal) {
+  const p = deal?.buyerPayout;
+  if (!p?.idChangedFrom?.length) return "";
+  return `⚠️ <@${deal.buyerId}> submitted Binance ID \`${p.binanceId}\` — different from the one on file ` +
+         `(${p.idChangedFrom.map(id => `\`${id}\``).join(", ")}). Both are kept in the Details Log.`;
+}
+
 function maskTail(value) {
   const s = String(value || "");
   return s.length > 4 ? `••••${s.slice(-4)}` : s;
@@ -399,18 +408,31 @@ async function recordSellerBank(member, bank) {
 // A new Binance ID fills every empty Binance cell this person has, and is appended
 // as "old / new" where one is already present. Only if they have no rows at all
 // does a fresh row get created.
-// Appends a value to a "a / b" cell, skipping it if already present and padding
-// the paired cell so the Nth entry always lines up with the Nth partner.
+// Appends a value to a "a / b" cell and pads the paired cell so the Nth entry
+// always lines up with the Nth partner. A value already on record is not added
+// twice, but a corrected partner replaces the old one — otherwise a buyer who
+// fixes a misspelt Binance Name mid-deal gets the old spelling offered back on
+// every later deal. A blank partner never wipes one already saved.
+// Returns { cells, known }: `cells` is the pair to write, or null for no write;
+// `known` is whether the value itself was already on record.
 function mergeMulti(currentValue, currentPartner, addValue, addPartner) {
-  const values = splitMulti(currentValue);
-  if (values.includes(addValue)) return null;              // already recorded
-
+  const values   = splitMulti(currentValue);
   const partners = splitMulti(currentPartner);
   while (partners.length < values.length) partners.push("—");
 
-  return values.length
-    ? [`${currentValue}${MULTI_SEP}${addValue}`, `${partners.join(MULTI_SEP)}${MULTI_SEP}${addPartner || "—"}`]
-    : [addValue, addPartner || ""];
+  const at = values.indexOf(addValue);
+  if (at !== -1) {
+    if (!addPartner || partners[at] === addPartner) return { cells: null, known: true };
+    partners[at] = addPartner;
+    return { cells: [currentValue, partners.join(MULTI_SEP)], known: true };
+  }
+
+  return {
+    cells: values.length
+      ? [`${currentValue}${MULTI_SEP}${addValue}`, `${partners.join(MULTI_SEP)}${MULTI_SEP}${addPartner || "—"}`]
+      : [addValue, addPartner || ""],
+    known: false
+  };
 }
 
 async function recordBuyerPayout(member, payout) {
@@ -436,6 +458,13 @@ async function recordBuyerPayout(member, payout) {
     return { ok: res !== null, added: res !== null, known: false, collisions };
   }
 
+  // One person normally holds one Binance account, so a buyer with an ID on file
+  // who submits a different one is worth a look. Nothing is replaced — the new ID
+  // is added beside the old — but staff are told. See idChangeNote().
+  const idsOnFile   = [...new Set(mine.flatMap(({ r }) => splitMulti(r[DCOL.BINANCE_ID])))];
+  const idChangedFrom = (payout.binanceId && idsOnFile.length && !idsOnFile.includes(payout.binanceId))
+    ? idsOnFile : [];
+
   // Binance ID/Name and Address/Network are two independent paired columns, so a
   // buyer can add a wallet to rows that already carry an exchange ID and back.
   const updates = [];
@@ -443,20 +472,20 @@ async function recordBuyerPayout(member, payout) {
 
   for (const { r, rowNum } of mine) {
     if (payout.binanceId) {
-      const merged = mergeMulti(r[DCOL.BINANCE_ID], r[DCOL.BINANCE_NAME], payout.binanceId, payout.binanceName);
-      if (merged) updates.push({ range: `${DETAILS_TAB}!I${rowNum}:J${rowNum}`, values: [merged] });
-      else knownId = true;
+      const { cells, known } = mergeMulti(r[DCOL.BINANCE_ID], r[DCOL.BINANCE_NAME], payout.binanceId, payout.binanceName);
+      if (cells) updates.push({ range: `${DETAILS_TAB}!I${rowNum}:J${rowNum}`, values: [cells] });
+      if (known) knownId = true;
     }
     if (payout.wallet) {
-      const merged = mergeMulti(r[DCOL.ADDRESS], r[DCOL.NETWORK], payout.wallet, payout.network);
-      if (merged) updates.push({ range: `${DETAILS_TAB}!M${rowNum}:N${rowNum}`, values: [merged] });
-      else knownWallet = true;
+      const { cells, known } = mergeMulti(r[DCOL.ADDRESS], r[DCOL.NETWORK], payout.wallet, payout.network);
+      if (cells) updates.push({ range: `${DETAILS_TAB}!M${rowNum}:N${rowNum}`, values: [cells] });
+      if (known) knownWallet = true;
     }
   }
 
   // "Known" means every account they gave us was already on record.
   const known = (!payout.binanceId || knownId) && (!payout.wallet || knownWallet);
-  if (updates.length === 0) return { ok: true, added: false, known, collisions };
+  if (updates.length === 0) return { ok: true, added: false, known, collisions, idChangedFrom };
 
   const res = await trySheet("Details Log payout update", async () => {
     const sheets = getSheets();
@@ -465,7 +494,7 @@ async function recordBuyerPayout(member, payout) {
       requestBody: { valueInputOption: "RAW", data: updates }
     });
   });
-  return { ok: res !== null, added: res !== null, known, collisions };
+  return { ok: res !== null, added: res !== null, known, collisions, idChangedFrom };
 }
 
 // ─── VERIFIED ROLE SYNC ───────────────────────────────────────────────────────
@@ -863,7 +892,7 @@ function detailButtonRows(key, token, sellerSaved, buyerSaved) {
     .setLabel(buyerSaved ? "➕ Buyer — Add Wallet / Update" : "🏦 Buyer — Payout Details")
     .setStyle(buyerSaved ? ButtonStyle.Secondary : ButtonStyle.Primary));
 
-  return [sellerRow, buyerRow];
+  return [buyerRow, sellerRow];   // same order as the deal announcement
 }
 
 // `prefill` carries whatever the party already chose this deal, so correcting a
@@ -1705,7 +1734,12 @@ async function handleDetailInteraction(interaction) {
     pendingPayout.delete(pk);
 
     const res = await recordBuyerPayout(member, payout);
-    deal.buyerPayout = { ...payout, knownAccount: res.known, collisions: res.collisions || [] };
+    // Resubmitting the same new ID — to fix its name, say — finds it on file by
+    // then, so without carrying the flag forward the resubmission would clear it.
+    const prev = deal.buyerPayout;
+    const idChangedFrom = res.idChangedFrom?.length ? res.idChangedFrom
+      : (prev?.idChangedFrom?.length && prev.binanceId === payout.binanceId) ? prev.idChangedFrom : [];
+    deal.buyerPayout = { ...payout, knownAccount: res.known, collisions: res.collisions || [], idChangedFrom };
     saveDeal(deal, ctx.file);
 
     // Built from whichever fields were given, so a wallet always carries its
@@ -1880,8 +1914,8 @@ client.on("interactionCreate", async interaction => {
     await dvaChannel.send({
       content:
         `📋 **Both parties — please submit your details below.**\n` +
-        `<@${seller.id}> — the account where you will receive PKR.\n` +
         `<@${buyer.id}> — the Binance account or wallet where you will receive USDT.\n` +
+        `<@${seller.id}> — the account where you will receive PKR.\n` +
         ((sellerSaved || buyerSaved)
           ? `\n*Green = reuse an account you've used before. Grey = enter a different one.*`
           : ``) +
@@ -2009,6 +2043,8 @@ client.on("interactionCreate", async interaction => {
       collisionNote(d.buyerPayout?.collisions, d)
     ].filter(Boolean).join("\n");
     if (collisions) lines.push(``, `── Shared accounts ──`, collisions);
+    const idChange = idChangeNote(d);
+    if (idChange) lines.push(``, idChange);
 
     // The gate holds the deposit address until both sides are in. Show staff who
     // it is waiting on, and give them a way out when a party genuinely can't
@@ -2111,6 +2147,8 @@ client.on("interactionCreate", async interaction => {
       collisionNote(ctx.deal.buyerPayout?.collisions, ctx.deal)
     ].filter(Boolean).join("\n");
     if (collisions) confirmReply += `\n\n${collisions}`;
+    const idChange = idChangeNote(ctx.deal);
+    if (idChange) confirmReply += `\n\n${idChange}`;
     return interaction.reply({ content: confirmReply, ephemeral: true });
   }
 
