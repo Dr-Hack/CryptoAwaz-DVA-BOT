@@ -1,6 +1,6 @@
 // DVA Bot - bot.js
-// Version: 2.3
-// Last Modified: 2026-09-21
+// Version: 2.4
+// Last Modified: 2026-10-12
 // Dependencies: discord.js@14, googleapis, dotenv, node-cron
 // Install: npm install discord.js googleapis dotenv node-cron
 
@@ -1132,6 +1132,32 @@ async function registerCommands() {
   console.log("[DVA] Slash commands registered.");
 }
 
+// ─── ESCROW ───────────────────────────────────────────────────────────────────
+// Traders agree a round figure and the seller grosses it up by hand so the buyer
+// receives it whole: 90.9 sent on a 90 deal, 20.2 on a 20. The fee then leaves
+// escrow at 89.991, and staff have been announcing — and releasing — 90 anyway.
+//
+// The gross-up leaves a signature. An escrow that was grossed up sits a hair
+// under a whole number; one that wasn't never lands that close (across the deals
+// run by hand in October the nearest miss was 108.9, a tenth away). So the bot
+// recognises it instead of asking anyone to declare it, and the hand arithmetic
+// disappears with no new option to remember.
+//
+// Two guards keep it honest. The gap must be tiny in absolute terms, and it must
+// also be small next to the fee itself — without the second, a 2 USDT deal would
+// snap 1.98 up to 2 and collect nothing at all. The cost is at most a couple of
+// paisa per deal, always in the buyer's favour. The Fund Log is untouched: it
+// records the gross and the full fee, because escrow is not one of its columns.
+const ESCROW_SNAP = 0.02;
+
+function escrowFor(amount, feePercent) {
+  const fee = amount * feePercent / 100;
+  const raw = parseFloat((amount - fee).toFixed(4));
+  const gap = parseFloat((Math.ceil(raw) - raw).toFixed(4));
+  if (gap > 0 && gap <= Math.min(ESCROW_SNAP, fee / 4)) return Math.ceil(raw);
+  return raw;
+}
+
 // ─── BOOSTER CHECK ────────────────────────────────────────────────────────────
 function getBoosterMonths(member) {
   if (!member?.premiumSince) return 0;
@@ -2118,11 +2144,11 @@ client.on("interactionCreate", async interaction => {
       ctx.deal.booster         = boosterMember.id;
       ctx.deal.boosterCampaign = isCampaignDeal;
       ctx.deal.boosterName  = boosterMember.user.username;
-      ctx.deal.escrowAmount = parseFloat((amount - amount * 0.005).toFixed(4));
+      ctx.deal.escrowAmount = escrowFor(amount, 0.5);
       note = `\n\n${discountTag}`;
     } else {
       ctx.deal.feePercent   = 1;
-      ctx.deal.escrowAmount = parseFloat((amount - amount * 0.01).toFixed(4));
+      ctx.deal.escrowAmount = escrowFor(amount, 1);
       note = amount >= BOOSTER_THRESHOLD ? "\n\n📋 Fee: **1%**" : "";
     }
 
@@ -2174,8 +2200,7 @@ client.on("interactionCreate", async interaction => {
 
     ctx.deal.amounts.push(addAmount);
     ctx.deal.amount       = newTotal;
-    const feePct          = ctx.deal.feePercent / 100;
-    ctx.deal.escrowAmount = parseFloat((ctx.deal.amount * (1 - feePct)).toFixed(4));
+    ctx.deal.escrowAmount = escrowFor(ctx.deal.amount, ctx.deal.feePercent);
 
     const amountDisplay = formatAmountDisplay(ctx.deal);
     const updateMsg = await dvaChannel.send(
