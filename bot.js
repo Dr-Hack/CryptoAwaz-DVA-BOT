@@ -1,6 +1,6 @@
 // DVA Bot - bot.js
-// Version: 2.4
-// Last Modified: 2026-10-12
+// Version: 2.5
+// Last Modified: 2026-10-18
 // Dependencies: discord.js@14, googleapis, dotenv, node-cron
 // Install: npm install discord.js googleapis dotenv node-cron
 
@@ -9,7 +9,8 @@ const feeCommand = require("./fee-command.js");
 const {
   Client, GatewayIntentBits, Partials, REST, Routes, SlashCommandBuilder,
   ActionRowBuilder, ButtonBuilder, ButtonStyle,
-  StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle
+  StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle,
+  FileUploadBuilder, LabelBuilder, TextDisplayBuilder
 } = require("discord.js");
 const { google } = require("googleapis");
 const cron = require("node-cron");
@@ -51,6 +52,7 @@ const DVA_TEMP_ROLE_ID      = process.env.DVA_TEMP_ROLE_ID;
 const DVA_CASH_CHANNEL_ID   = process.env.DVA_CASH_CHANNEL_ID;
 const DVA_CASH_TEMP_ROLE_ID = process.env.DVA_CASH_TEMP_ROLE_ID;
 const BUYSELL_CHANNEL_ID    = process.env.BUYSELL_CHANNEL_ID;
+const RECORD_CHANNEL_ID     = process.env.RECORD_CHANNEL_ID;   // #for-the-record — cash receipts kept after close
 const SHEET_ID            = process.env.SHEET_ID;
 const FUND_LOG_TAB        = process.env.SHEET_TAB || "Fund Log";
 const MONTHLY_TAB         = "Monthly Collection";
@@ -1048,10 +1050,11 @@ async function purgeDetailMsgs(channel, deal) {
 // ─── DISCORD CLIENT ───────────────────────────────────────────────────────────
 const client = new Client({
   intents: [
+    // No privileged intents. Discord denied them on 2026-10-17, so the receipt
+    // arrives through the 📸 Upload Receipt button rather than by reading
+    // channel messages, and members are fetched one at a time when needed.
     GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMembers,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent
+    GatewayIntentBits.GuildMessages
   ],
   partials: [Partials.Channel]
 });
@@ -1352,7 +1355,80 @@ function gateWillOpen(deal) {
 // than arriving after the money has already moved.
 function sendFundsPrompt(deal) {
   return `<@${deal.buyerId}> Please send funds to <@${deal.sellerId}>\n` +
-         `📸 Please send screenshot of receipt showing **sender and receiver name**.`;
+         `📸 Then tap **Upload Receipt** below — the receipt must show **sender and receiver name**.`;
+}
+
+// Rides on every message carrying sendFundsPrompt, so the upload is always one
+// tap away from the instruction that asks for it.
+function receiptRow(key, deal) {
+  return new ActionRowBuilder().addComponents(new ButtonBuilder()
+    .setCustomId(cid("receipt", key, deal.dealToken))
+    .setLabel("📸 Upload Receipt")
+    .setStyle(ButtonStyle.Primary));
+}
+
+function receiptModal(key, token) {
+  return new ModalBuilder()
+    .setCustomId(cid("receiptmodal", key, token))
+    .setTitle("Upload Payment Receipt")
+    .addTextDisplayComponents(new TextDisplayBuilder().setContent(
+      "## ⚠️ Ensure the receipt has Sender and Receiver name.\n" +
+      "A receipt without both names can't be matched to the seller's account, and your release will be held."))
+    .addLabelComponents(new LabelBuilder()
+      .setLabel("Receipt screenshot")
+      .setDescription("Bank transfer, CDM or deposit slip — up to 3 images or PDFs.")
+      .setFileUploadComponent(new FileUploadBuilder()
+        .setCustomId("file").setMinValues(1).setMaxValues(3).setRequired(true)));
+}
+
+// Cash deals have no bank trail, so their receipts are copied to #for-the-record,
+// which outlives the /dva close sweep. Silent no-op for #dva deals, or when the
+// channel isn't configured. Never pings — it is an archive, not a conversation.
+async function recordReceipt(guild, key, deal, files) {
+  if (key !== "cash" || !RECORD_CHANNEL_ID || !files.length) return;
+  const channel = guild.channels.cache.get(RECORD_CHANNEL_ID);
+  if (!channel) return console.error("[DVA] RECORD_CHANNEL_ID not found in this server.");
+  const date = new Date().toLocaleDateString("en-GB", { timeZone: "Asia/Karachi" });
+  await channel.send({
+    content: `🧾 **Cash DVA receipt** — ${date}\n` +
+             `Buyer <@${deal.buyerId}> → Seller <@${deal.sellerId}> · ${deal.amount} USDT · Staff <@${deal.staffId}>`,
+    files: files.map(f => ({ attachment: f.url, name: f.name })),
+    allowedMentions: { parse: [] }
+  }).catch(e => console.error("[DVA] Receipt record copy failed:", e.message));
+}
+
+// Shared by the upload button and the image fallback in messageCreate. The bot
+// can't read a receipt, only notice one — so it records that one arrived and
+// asks the seller to confirm. `replyTo` is the message the nudge hangs off.
+async function receiptArrived(guild, key, deal, replyTo) {
+  // Remember a receipt arrived. Waiting for a second image would strand the
+  // deal — the buyer has no reason to post another one — so submitting their
+  // details is what completes the flow instead. See announceBuyerPayout().
+  deal.receiptSeen = true;
+
+  if (!deal.buyerPayout) {
+    if (deal.payoutNudged) { saveDeal(deal, dealState[key].file); return null; }
+    deal.payoutNudged = true;
+    // The counterparty must confirm the money arrived whichever way it moved —
+    // bank transfer, CDM deposit or cash in hand — so ask for that here rather
+    // than only once payout details turn up. Staff are tagged so they know a
+    // deal is waiting even if the buyer never submits.
+    const nudge = await replyTo.reply(
+      `🧾 Receipt received from <@${deal.buyerId}>\n\n` +
+      `<@${deal.sellerId}> — please confirm you have received the payment.\n\n` +
+      `⚠️ <@${deal.buyerId}> you haven't submitted your payout details yet. ` +
+      `Tap **🏦 Buyer — Payout Details** above so staff know where to release your crypto.\n\n` +
+      `<@${deal.staffId}> — this deal is waiting on payout details.`
+    ).catch(() => null);
+    // Chased-for-details chatter is meaningless once the deal is over, so it
+    // goes with the rest of the sweep. Tracked before the save, or a restart
+    // between the two would strand the message in the channel forever.
+    trackDetailMsg(deal, nudge);
+    saveDeal(deal, dealState[key].file);
+    return nudge;
+  }
+
+  return postBuyerPayout(guild, key, deal, `🧾 Receipt received from <@${deal.buyerId}>`);
 }
 
 // What the channel sees when the buyer submits payout details. If their receipt
@@ -1370,10 +1446,10 @@ async function announceSellerBank(guild, key, deal, note = "") {
     const prefix = deal.bankPosted
       ? `♻️ <@${deal.sellerId}> has **updated** their bank details — use the ones below.`
       : `✅ <@${deal.sellerId}> has now submitted their bank details.`;
-    const msg = await channel.send(
-      `${prefix}\n\n${sellerBankBlock(deal, sellerMember)}\n\n` +
-      sendFundsPrompt(deal)
-    );
+    const msg = await channel.send({
+      content: `${prefix}\n\n${sellerBankBlock(deal, sellerMember)}\n\n` + sendFundsPrompt(deal),
+      components: [receiptRow(key, deal)]
+    });
     trackDetailMsg(deal, msg);
     deal.bankPosted = true;
     saveDeal(deal, dealState[key].file);
@@ -1783,6 +1859,63 @@ async function handleDetailInteraction(interaction) {
     return announceBuyerPayout(guild, key, deal,
       res.ok ? "" : `\n⚠️ Not saved to Details Log — sheet unreachable.`);
   }
+
+  // ── Buyer: upload the payment receipt ──────────────────────────────────────
+  if (action === "receipt") {
+    if (!deal.escrowAmount) {
+      return interaction.reply({ content: "❌ Escrow isn't confirmed yet — send funds only after staff confirm the crypto has arrived.", ephemeral: true });
+    }
+    if (deal.released) {
+      return interaction.reply({ content: "ℹ️ Escrow has already been released for this deal.", ephemeral: true });
+    }
+    return interaction.showModal(receiptModal(key, token));
+  }
+
+  if (action === "receiptmodal") {
+    await interaction.deferReply({ ephemeral: true });
+    if (deal.released) return interaction.editReply({ content: "ℹ️ Escrow has already been released for this deal." });
+
+    const files = [...interaction.fields.getUploadedFiles("file", true).values()];
+    const retry = [new ActionRowBuilder().addComponents(new ButtonBuilder()
+      .setCustomId(cid("receipt", key, token)).setLabel("📸 Try Again").setStyle(ButtonStyle.Primary))];
+    if (files.some(f => !/^(image\/|application\/pdf)/.test(f.contentType || ""))) {
+      return interaction.editReply({ content: "❌ Only images or PDFs can be uploaded as a receipt.", components: retry });
+    }
+
+    // Whether the receipt flow below will post its own message tagging the
+    // seller. When it won't — a second receipt, or a nudge already sent — this
+    // post has to ask the seller to confirm by itself.
+    const willFollow = !deal.payoutPosted && (deal.buyerPayout || !deal.payoutNudged);
+    const content = willFollow
+      ? `🧾 **Receipt uploaded by <@${deal.buyerId}>**`
+      : `🧾 **Receipt uploaded by <@${deal.buyerId}>**\n\n<@${deal.sellerId}> — please confirm you have received this payment.`;
+
+    // Re-uploaded rather than linked: the link on a modal upload expires. If the
+    // bot lacks Attach Files in this channel, fall back to the links so the
+    // receipt is at least visible today.
+    const channel = dvaChannelFor(guild, key);
+    let posted = await channel.send({
+      content,
+      files: files.map(f => ({ attachment: f.url, name: f.name }))
+    }).catch(e => { console.error("[DVA] Receipt re-upload failed:", e.message); return null; });
+    if (!posted) {
+      posted = await channel.send(`${content}\n\n${files.map(f => f.url).join("\n")}`).catch(() => null);
+    }
+    if (!posted) {
+      return interaction.editReply({ content: "❌ Couldn't post your receipt. Please share the screenshot in the channel and tag staff.", components: retry });
+    }
+
+    // Receipts name both parties' accounts, so they go with the /dva close sweep
+    // like every other detail message. Cash receipts survive in #for-the-record.
+    trackDetailMsg(deal, posted);
+    if (!deal.receiptUrls) deal.receiptUrls = [];
+    deal.receiptUrls.push(posted.url);
+    saveDeal(deal, ctx.file);
+    await recordReceipt(guild, key, deal, files);
+
+    await interaction.editReply({ content: "✅ Receipt posted in the channel — the seller and staff can see it now." });
+    if (!deal.payoutPosted) return receiptArrived(guild, key, deal, posted);
+  }
 }
 
 client.on("interactionCreate", async interaction => {
@@ -2052,8 +2185,8 @@ client.on("interactionCreate", async interaction => {
     if (!ctx.deal) return interaction.reply({ content: "❌ No active deal.", ephemeral: true });
 
     const d       = ctx.deal;
-    const sMember = guild.members.cache.get(d.sellerId);
-    const bMember = guild.members.cache.get(d.buyerId);
+    const sMember = await guild.members.fetch(d.sellerId).catch(() => null);
+    const bMember = await guild.members.fetch(d.buyerId).catch(() => null);
 
     const lines = [`📋 **Deal details** — <@${d.buyerId}> *(buyer)* ↔ <@${d.sellerId}> *(seller)*`, ``];
     lines.push(d.sellerBank
@@ -2071,6 +2204,12 @@ client.on("interactionCreate", async interaction => {
     if (collisions) lines.push(``, `── Shared accounts ──`, collisions);
     const idChange = idChangeNote(d);
     if (idChange) lines.push(``, idChange);
+
+    const receipts = d.receiptUrls || [];
+    lines.push(``, receipts.length
+      ? `🧾 **Receipt${receipts.length > 1 ? "s" : ""}:** ${receipts.map((u, i) => `[view ${i + 1}](${u})`).join(" · ")}`
+      : d.receiptSeen ? `🧾 **Receipt:** posted in chat — scroll up in the channel.`
+      : `🧾 **Receipt:** not uploaded yet.`);
 
     // The gate holds the deposit address until both sides are in. Show staff who
     // it is waiting on, and give them a way out when a party genuinely can't
@@ -2110,8 +2249,8 @@ client.on("interactionCreate", async interaction => {
     ctx.deal.amount   = amount;
     ctx.deal.amounts  = [amount];
 
-    const bMember = guild.members.cache.get(ctx.deal.buyerId);
-    const sMember = guild.members.cache.get(ctx.deal.sellerId);
+    const bMember = await guild.members.fetch(ctx.deal.buyerId).catch(() => null);
+    const sMember = await guild.members.fetch(ctx.deal.sellerId).catch(() => null);
 
     let boosterMember  = null;
     let discountTag    = null;
@@ -2152,12 +2291,14 @@ client.on("interactionCreate", async interaction => {
       note = amount >= BOOSTER_THRESHOLD ? "\n\n📋 Fee: **1%**" : "";
     }
 
-    const confirmMsg = await dvaChannel.send(
-      `✅ ${amount} USDT received\n` +
-      `🔒 ${ctx.deal.escrowAmount} USDT escrow${note}\n\n` +
-      `${sellerBlockOrWarning(ctx.deal, sMember)}\n\n` +
-      sendFundsPrompt(ctx.deal)
-    );
+    const confirmMsg = await dvaChannel.send({
+      content:
+        `✅ ${amount} USDT received\n` +
+        `🔒 ${ctx.deal.escrowAmount} USDT escrow${note}\n\n` +
+        `${sellerBlockOrWarning(ctx.deal, sMember)}\n\n` +
+        sendFundsPrompt(ctx.deal),
+      components: [receiptRow(key, ctx.deal)]
+    });
     if (ctx.deal.sellerBank) { trackDetailMsg(ctx.deal, confirmMsg); ctx.deal.bankPosted = true; }
     saveDeal(ctx.deal, ctx.file);
 
@@ -2203,12 +2344,15 @@ client.on("interactionCreate", async interaction => {
     ctx.deal.escrowAmount = escrowFor(ctx.deal.amount, ctx.deal.feePercent);
 
     const amountDisplay = formatAmountDisplay(ctx.deal);
-    const updateMsg = await dvaChannel.send(
-      `✅ ${amountDisplay} USDT received\n` +
-      `🔒 ${ctx.deal.escrowAmount} USDT escrow\n\n` +
-      `${sellerBlockOrWarning(ctx.deal, guild.members.cache.get(ctx.deal.sellerId))}\n\n` +
-      sendFundsPrompt(ctx.deal)
-    );
+    const sellerMember = await guild.members.fetch(ctx.deal.sellerId).catch(() => null);
+    const updateMsg = await dvaChannel.send({
+      content:
+        `✅ ${amountDisplay} USDT received\n` +
+        `🔒 ${ctx.deal.escrowAmount} USDT escrow\n\n` +
+        `${sellerBlockOrWarning(ctx.deal, sellerMember)}\n\n` +
+        sendFundsPrompt(ctx.deal),
+      components: [receiptRow(key, ctx.deal)]
+    });
     if (ctx.deal.sellerBank) trackDetailMsg(ctx.deal, updateMsg);
     saveDeal(ctx.deal, ctx.file);
 
@@ -2356,9 +2500,12 @@ client.on("interactionCreate", async interaction => {
 client.on("messageCreate", async message => {
   if (message.author.bot) return;
 
-  // ── RECEIPT IMAGE TRIGGER ───────────────────────────────────────────────────
-  // The bot can't read a receipt, only notice one. Guarding on buyer + live
-  // escrow + not-yet-released + once-per-deal keeps stray images from firing it.
+  // ── RECEIPT IMAGE TRIGGER (fallback) ────────────────────────────────────────
+  // The 📸 Upload Receipt button is the main route. Without the Message Content
+  // intent, attachments only reach the bot when the buyer pings it or replies to
+  // one of its messages — so this still catches those and is silent otherwise.
+  // Guarding on buyer + live escrow + not-yet-released + once-per-deal keeps
+  // stray images from firing it.
   const dealKey = message.channel.id === DVA_CHANNEL_ID      ? "normal"
                 : message.channel.id === DVA_CASH_CHANNEL_ID ? "cash"
                 : null;
@@ -2370,34 +2517,11 @@ client.on("messageCreate", async message => {
     if (deal.payoutPosted)                         return;
     if (!message.attachments.some(a => (a.contentType || "").startsWith("image/"))) return;
 
-    // Remember a receipt arrived. Waiting for a second image would strand the
-    // deal — the buyer has no reason to post another one — so submitting their
-    // details is what completes the flow instead. See announceBuyerPayout().
-    deal.receiptSeen = true;
-
-    if (!deal.buyerPayout) {
-      if (deal.payoutNudged) { saveDeal(deal, dealState[dealKey].file); return; }
-      deal.payoutNudged = true;
-      // The counterparty must confirm the money arrived whichever way it moved —
-      // bank transfer, CDM deposit or cash in hand — so ask for that here rather
-      // than only once payout details turn up. Staff are tagged so they know a
-      // deal is waiting even if the buyer never submits.
-      const nudge = await message.reply(
-        `🧾 Receipt received from <@${deal.buyerId}>\n\n` +
-        `<@${deal.sellerId}> — please confirm you have received the payment.\n\n` +
-        `⚠️ <@${deal.buyerId}> you haven't submitted your payout details yet. ` +
-        `Tap **🏦 Buyer — Payout Details** above so staff know where to release your crypto.\n\n` +
-        `<@${deal.staffId}> — this deal is waiting on payout details.`
-      ).catch(() => null);
-      // Chased-for-details chatter is meaningless once the deal is over, so it
-      // goes with the rest of the sweep. Tracked before the save, or a restart
-      // between the two would strand the message in the channel forever.
-      trackDetailMsg(deal, nudge);
-      saveDeal(deal, dealState[dealKey].file);
-      return;
-    }
-
-    return postBuyerPayout(message.guild, dealKey, deal, `🧾 Receipt received from <@${deal.buyerId}>`)
+    // The buyer's own message can't be swept (no Manage Messages), so staff still
+    // delete it by hand — but a cash receipt is copied to the record first.
+    await recordReceipt(message.guild, dealKey, deal,
+      [...message.attachments.filter(a => (a.contentType || "").startsWith("image/")).values()]);
+    return receiptArrived(message.guild, dealKey, deal, message)
       .catch(e => console.error("[DVA] Receipt trigger error:", e));
   }
 
