@@ -1,6 +1,6 @@
 // DVA Bot - bot.js
-// Version: 2.5
-// Last Modified: 2026-10-18
+// Version: 2.6
+// Last Modified: 2026-10-20
 // Dependencies: discord.js@14, googleapis, dotenv, node-cron
 // Install: npm install discord.js googleapis dotenv node-cron
 
@@ -1998,6 +1998,7 @@ client.on("interactionCreate", async interaction => {
 
   // ── /dva start ──────────────────────────────────────────────────────────────
   if (sub === "start") {
+    stopStaffEscalation();
     if (ctx.deal) {
       return interaction.reply({
         content: `⚠️ A ${key} deal is already in progress (started by <@${ctx.deal.staffId}>). Close or cancel it first.`,
@@ -2496,6 +2497,51 @@ client.on("interactionCreate", async interaction => {
   }
 });
 
+// ─── STAFF PING ESCALATION ────────────────────────────────────────────────────
+// Role pings don't always notify staff, so when @Staff is tagged in #buy-sell
+// with both DVA slots free, the bot pings each STAFF member by name. The gap
+// grows each round (1, 2, 3 … min) for at most 10 pings. Any staff message in
+// #buy-sell or any /dva start ends it. In memory only — a restart drops it.
+const ESCALATION_MAX_PINGS = 10;
+const staffEscalation = { timer: null, round: 0, lastMsg: null };
+
+function stopStaffEscalation() {
+  if (staffEscalation.timer) clearTimeout(staffEscalation.timer);
+  staffEscalation.timer = null;
+  staffEscalation.round = 0;
+  staffEscalation.lastMsg?.delete().catch(() => {});
+  staffEscalation.lastMsg = null;
+}
+
+function scheduleStaffPing(channel) {
+  const delayMin = staffEscalation.round + 1;
+  staffEscalation.timer = setTimeout(async () => {
+    try {
+      // A slot may have filled from elsewhere since the last round.
+      if (dealState.normal.deal || dealState.cash.deal) return stopStaffEscalation();
+      staffEscalation.lastMsg?.delete().catch(() => {});
+      const ids = Object.keys(STAFF);
+      staffEscalation.lastMsg = await channel.send({
+        content: `${ids.map(id => `<@${id}>`).join(" ")} — Your attention may be required here in <#${BUYSELL_CHANNEL_ID}>.`,
+        allowedMentions: { users: ids }
+      });
+      // Staff answered while the send was in flight.
+      if (!staffEscalation.timer) return staffEscalation.lastMsg.delete().catch(() => {});
+      staffEscalation.round++;
+      if (staffEscalation.round >= ESCALATION_MAX_PINGS) {
+        staffEscalation.timer = null;
+        staffEscalation.round = 0;
+        staffEscalation.lastMsg = null; // leave the last ping up
+        return;
+      }
+      scheduleStaffPing(channel);
+    } catch (e) {
+      console.error("[DVA] Staff escalation error:", e);
+      stopStaffEscalation();
+    }
+  }, delayMin * 60 * 1000);
+}
+
 // ─── STAFF MENTION LISTENER ───────────────────────────────────────────────────
 client.on("messageCreate", async message => {
   if (message.author.bot) return;
@@ -2526,12 +2572,23 @@ client.on("messageCreate", async message => {
   }
 
   if (message.channel.id !== BUYSELL_CHANNEL_ID) return;
+
+  // Any staff message here means someone is around.
+  const isStaff = !!STAFF[message.author.id] || !!message.member?.roles.cache.has(STAFF_ROLE_ID);
+  if (isStaff) {
+    if (staffEscalation.timer) stopStaffEscalation();
+    return;
+  }
+
   if (!message.mentions.roles.has(STAFF_ROLE_ID)) return;
 
   const normalBusy = !!dealState.normal.deal;
   const cashBusy   = !!dealState.cash.deal;
 
-  if (!normalBusy && !cashBusy) return;
+  if (!normalBusy && !cashBusy) {
+    if (!staffEscalation.timer) scheduleStaffPing(message.channel);
+    return;
+  }
 
   if (normalBusy && cashBusy) {
     await message.reply(`⏳ DVA deals are currently in progress in both <#${DVA_CHANNEL_ID}> and <#${DVA_CASH_CHANNEL_ID}>. Please wait and I will let you know once a slot is available.`);
