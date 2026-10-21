@@ -1,6 +1,6 @@
 // DVA Bot - bot.js
-// Version: 2.6
-// Last Modified: 2026-10-20
+// Version: 2.7
+// Last Modified: 2026-10-22
 // Dependencies: discord.js@14, googleapis, dotenv, node-cron
 // Install: npm install discord.js googleapis dotenv node-cron
 
@@ -1355,7 +1355,8 @@ function gateWillOpen(deal) {
 // than arriving after the money has already moved.
 function sendFundsPrompt(deal) {
   return `<@${deal.buyerId}> Please send funds to <@${deal.sellerId}>\n` +
-         `📸 Then tap **Upload Receipt** below — the receipt must show **sender and receiver name**.`;
+         `### 📸 After paying, tap the Upload Receipt button below 👇\n` +
+         `Receipt must show **sender and receiver name**.`;
 }
 
 // Rides on every message carrying sendFundsPrompt, so the upload is always one
